@@ -1356,6 +1356,8 @@ const (
 	ReclaimResourcesWorkflowScope
 	DeleteExecutionsWorkflowScope
 
+	CountNamespaceOpenWorkflowsScope
+
 	NumWorkerScopes
 )
 
@@ -1989,6 +1991,7 @@ var ScopeDefs = map[ServiceIdx]map[int]scopeDefinition{
 		DeleteNamespaceWorkflowScope:           {operation: "DeleteNamespaceWorkflow"},
 		ReclaimResourcesWorkflowScope:          {operation: "ReclaimResourcesWorkflow"},
 		DeleteExecutionsWorkflowScope:          {operation: "DeleteExecutionsWorkflow"},
+		CountNamespaceOpenWorkflowsScope:       {operation: "CountNamespaceOpenWorkflows"},
 	},
 	Server: {
 		ServerTlsScope: {operation: "ServerTls"},
@@ -2482,6 +2485,8 @@ const (
 	DeleteExecutionNotFoundCount
 	RateLimiterFailuresCount
 
+	NamespaceOpenWorkflowsGauge
+
 	NumWorkerMetrics
 )
 
@@ -2966,6 +2971,7 @@ var MetricDefs = map[ServiceIdx]map[int]metricDefinition{
 		DeleteExecutionFailuresCount: NewCounterDef("delete_execution_failures"),
 		DeleteExecutionNotFoundCount: NewCounterDef("delete_execution_not_found"),
 		RateLimiterFailuresCount:     NewCounterDef("rate_limiter_failures"),
+		NamespaceOpenWorkflowsGauge:  NewGaugeDef("namespace_open_workflows"),
 	},
 	Server: {
 		TlsCertsExpired:  NewGaugeDef("certificates_expired"),

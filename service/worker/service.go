@@ -26,6 +26,7 @@ package worker
 
 import (
 	"context"
+	"go.temporal.io/server/service/worker/statsreporter"
 	"math/rand"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,10 @@ type (
 		BatcherConcurrency                    dynamicconfig.IntPropertyFnWithNamespaceFilter
 		EnableParentClosePolicyWorker         dynamicconfig.BoolPropertyFn
 		PerNamespaceWorkerCount               dynamicconfig.IntPropertyFnWithNamespaceFilter
+		EnableNamespaceStatsReporter          dynamicconfig.BoolPropertyFn
+		NamespaceStatsReportInterval          dynamicconfig.DurationPropertyFn
+		EmitOpenWorkflowCount                 dynamicconfig.BoolPropertyFnWithNamespaceFilter
+		StatsReporterCountWorkflowMaxQPS      dynamicconfig.IntPropertyFn
 
 		StandardVisibilityPersistenceMaxReadQPS   dynamicconfig.IntPropertyFn
 		StandardVisibilityPersistenceMaxWriteQPS  dynamicconfig.IntPropertyFn
@@ -340,6 +345,11 @@ func NewConfig(dc *dynamicconfig.Collection, persistenceConfig *config.Persisten
 			true,
 		),
 
+		EnableNamespaceStatsReporter:     dc.GetBoolProperty(dynamicconfig.EnableNamespaceStatsReporter, false),
+		NamespaceStatsReportInterval:     dc.GetDurationProperty(dynamicconfig.NamespaceStatsReportInterval, 3*time.Minute),
+		EmitOpenWorkflowCount:            dc.GetBoolPropertyFnWithNamespaceFilter(dynamicconfig.EmitOpenWorkflowCount, true),
+		StatsReporterCountWorkflowMaxQPS: dc.GetIntProperty(dynamicconfig.StatsReporterCountWorkflowMaxQPS, 10),
+
 		StandardVisibilityPersistenceMaxReadQPS:   dc.GetIntProperty(dynamicconfig.StandardVisibilityPersistenceMaxReadQPS, 9000),
 		StandardVisibilityPersistenceMaxWriteQPS:  dc.GetIntProperty(dynamicconfig.StandardVisibilityPersistenceMaxWriteQPS, 9000),
 		AdvancedVisibilityPersistenceMaxReadQPS:   dc.GetIntProperty(dynamicconfig.AdvancedVisibilityPersistenceMaxReadQPS, 9000),
@@ -407,6 +417,10 @@ func (s *Service) Start() {
 		s.hostInfo,
 		s.workerServiceResolver,
 	)
+
+	if s.config.EnableNamespaceStatsReporter() {
+		s.startStatsReporter()
+	}
 
 	s.logger.Info(
 		"worker service started",
@@ -546,6 +560,19 @@ func (s *Service) startArchiver() {
 			tag.Error(err),
 		)
 	}
+}
+
+func (s *Service) startStatsReporter() {
+	reporter := &statsreporter.StatsReporter{
+		Logger:                s.logger,
+		MetricsClient:         s.metricsClient,
+		MetadataManager:       s.metadataManager,
+		VisibilityManager:     s.visibilityManager,
+		ReportInterval:        s.config.NamespaceStatsReportInterval,
+		EmitOpenWorkflowCount: s.config.EmitOpenWorkflowCount,
+		CountWorkflowMaxQPS:   s.config.StatsReporterCountWorkflowMaxQPS,
+	}
+	reporter.Start()
 }
 
 func (s *Service) ensureSystemNamespaceExists(
