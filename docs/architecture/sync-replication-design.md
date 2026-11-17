@@ -17,7 +17,7 @@ Status: draft for discussion. Based on `temporalio/temporal` at `23e4eab` (2026-
 Two more options sit on top of this:
 
 - **Sync can be chosen per event type (§3.6).** A namespace lists which events trigger the sync path, for example only `WorkflowExecutionStarted`. A transaction containing one of those events waits for quorum. All other transactions take today's async path. Because the replication log is ordered, a committed sync transaction also makes every earlier async transaction in its lane durable.
-- **Two clusters with a degraded mode (§5).** Majority quorum needs 3 clusters, so with 2 any single failure stops progress. For 2 clusters, commit uses an *in-sync replica set* (ISR, the Kafka model) instead. A failed peer is removed from the set, the survivor keeps running in a degraded (effectively async) state, and the peer is added back once it has caught up. A dead peer and a network partition look the same from inside 2 clusters, so changes to the set must be recorded in a small **arbiter** outside both clusters. Without an arbiter, degradation still works, but every unplanned failover becomes a manual decision that accepts data loss.
+- **Two clusters with a degraded mode (§5).** Majority quorum needs 3 clusters, so with 2 any single failure stops progress. For 2 clusters, commit uses an *in-sync replica set* (ISR, the Kafka model) instead. A failed peer is removed from the set, the survivor keeps running in a degraded (effectively async) state, and the peer is added back once it has caught up. A dead peer and a network partition look the same from inside 2 clusters, so changes to the set are made through the **control plane**, which acts as the arbiter: a CAS record of epoch, leader and in-sync set, plus a lease that the active must hold while degraded.
 
 ## 1. How replication works today, mapped to Raft
 
@@ -133,7 +133,7 @@ The queue-task check on the task's own barrier is kept even though §3.3 would b
 The active cluster keeps accepting and persisting writes, but every gated effect waits, so the namespace is effectively unavailable (CP). Two knobs:
 
 - **Leader lease:** if there's been no quorum ack for `T`, reject new writes with `Unavailable` right away. This limits how much uncommitted tail builds up, which later has to be rolled back, and lets clients fail fast.
-- **Degrade to async**: in ISR mode (§5), drop the failed peer from the in-sync set through the arbiter and keep running in a degraded state. In majority mode with N≥3 this is an explicit operator action. Either way it's recorded so the RPO change can be audited, and it never happens silently.
+- **Degrade to async**: in ISR mode (§5), drop the failed peer from the in-sync set through the control plane and keep running in a degraded state. In majority mode with N≥3 this is an explicit operator action. Either way it's recorded so the RPO change can be audited, and it never happens silently.
 
 ### 3.6 Selective sync per event type
 
@@ -239,35 +239,44 @@ commit[s][ℓ] = min over p ∈ ISR \ {leader} of ack[p][s][ℓ]      // +∞ if
 
 This is Kafka's ISR model with `min.insync.replicas` as a knob, and close to MySQL semi-sync with fallback.
 
-### 5.3 Telling a dead peer from a partition needs an arbiter
+### 5.3 The control plane as arbiter
 
 From inside 2 clusters, "B is dead" and "A and B are partitioned" look the same. Suppose A drops B on its own while B is only partitioned off, and failover automation promotes B. Now both clusters are active. Writes A committed while degraded are lost when the two reconcile, which is exactly what sync replication was supposed to prevent.
 
-So ISR membership and the epoch must live in a **replication arbiter**: a small linearizable compare-and-set (CAS) store outside both clusters' failure domains.
+So ISR membership and the epoch must live outside both clusters. **The control plane plays that role.** It is both the record and the decision-maker. The clusters report health and replication lag to it and carry out its decisions.
 
-- **Record**, per namespace or per routing group: `{epoch (failover version), leader, isr[], degraded_since, per-shard watermarks at shrink time}`.
-- **Implementation options:**
-  - a witness: a minimal Temporal deployment (frontend plus DB, no workflow data) in a third region,
-  - or an external consensus store: etcd, Spanner, or a strongly consistent DynamoDB table.
-- **Arbiter outage** blocks only *membership changes* (shrink, rejoin, failover), never steady-state commits.
+**What the control plane has to provide:**
 
-The rules, all serialized by CAS on the arbiter:
+1. **A linearizable compare-and-set (CAS) record** per replication group: `{epoch (failover version), leader, isr[], degraded_since, per-shard watermarks at shrink time, degraded lease}`. Key it per cluster pair, with the list of sync namespaces it covers. Then one CAS degrades every affected namespace when a cluster fails, instead of one per namespace. Per-namespace or per-routing-group keys are possible if a finer grain is needed.
+2. **A failure domain independent of both data clusters.** It must not live only in A's or B's region. It has to stay up when either region is down.
+3. **Reachability from both clusters' history services**, directly or through a cluster-local agent.
+4. **No part in the hot path.** It's used only for shrink, rejoin, promote and lease renewals. If the control plane is down, steady-state commits continue. Only membership changes and failovers wait.
+5. **A durable audit log** of degraded windows and unclean promotes, so the RPO exposure is always known.
 
-| Action | Who | Condition | Effect |
+**The rules, all serialized by CAS on the control plane record:**
+
+| Action | Decided by | Condition | Effect |
 |---|---|---|---|
-| **Shrink** | Leader A | B's acks haven't moved on any sync lane with pending waiters for `D` (e.g. 10–30 s), or its stream has been down for `D` | CAS `isr {A,B} → {A}` at epoch e. Only once it succeeds may A commit without B. Waiters held at that moment are released. |
-| **Promote** | Candidate B | B ∈ isr at the current epoch | CAS `epoch e → e', leader = B, isr = {B}` (A is unreachable). B starts degraded. |
-| **Rejoin** | Leader A | B is caught up (§5.4) | CAS `isr {A} → {A,B}` at the same epoch. |
-| **Unclean promote** | Operator only | B ∉ isr (the leader died while degraded) | Promote B anyway, accepting loss of A's writes since `degraded_since`. The arbiter reports the exact per-shard window. Never automatic. |
+| **Shrink** | Control plane, at A's request or from its own probes | B's acks haven't moved on any sync lane with pending waiters for `D` (e.g. 10–30 s), or its stream has been down for `D` | CAS `isr {A,B} → {A}` at epoch e, and grant A a **degraded lease**. Only after A sees the CAS succeed may it commit without B. Waiters held at that moment are released. |
+| **Lease renewal** | A | A is degraded | A renews periodically, for example every lease/3. If A can't renew before the lease expires, by its own monotonic clock with a drift margin, it stops accepting writes for the group's namespaces. Behavior is the same as `HANDOVER` today. |
+| **Promote** | Control plane | B ∈ isr at the current epoch, and A is unhealthy | CAS `epoch e → e', leader = B, isr = {B}`. B fences A (§4.3) as soon as it learns of the promotion, then starts degraded with its own lease. |
+| **Rejoin** | Control plane, at A's request | B is caught up (§5.4) | CAS `isr {A} → {A,B}` at the same epoch. The degraded lease ends. |
+| **Unclean promote** | Operator through the control plane, never automatic | B ∉ isr (A died while degraded) | Allowed only **after A's degraded lease has expired**. Promotes B and accepts loss of A's writes since `degraded_since`. The control plane reports the exact per-shard window. |
 
-Shrink and Promote race through the arbiter, so exactly one wins. If A's shrink wins, B is no longer eligible. If B's promotion wins, A's shrink CAS fails, and A learns it has been demoted; B's voters also fence A, as in §4.3. Cost of a peer failure: one blip of about `D` + CAS latency on sync transactions, then normal operation in the degraded state.
+**Why this is safe:**
 
-**Without an arbiter**, A can still shrink on its own, since its local DB is the only record. But B can then never be promoted automatically: it can't know whether it was dropped. Every unplanned failover becomes an operator-confirmed unclean promote. That's safe, but recovery time depends on a human.
+- **Healthy mode (ISR = {A,B}):** every commit needs B's ack. Once B is promoted it stops acking A, so A can't commit, and A's shrink CAS fails on the stale epoch. That's how A learns it has been demoted.
+- **Degraded mode (ISR = {A}):** A commits alone, but only while it holds the lease. An unclean promote of B waits for that lease to expire. So even when A is alive but cut off from the control plane, A has stopped writing before B starts.
+- **Racing changes:** shrink and promote go through the same CAS record, so exactly one wins.
+
+**Cost of a peer failure:** one pause of about `D` plus CAS latency on sync transactions. After that the survivor runs normally in the degraded state.
+
+**Majority mode (N ≥ 3)** can also be driven by the control plane: it picks the candidate and runs §4.3's prepare round. There, safety comes from the voters' promises, not from the control plane record.
 
 ### 5.4 Degraded state and recovery
 
 1. **While degraded:**
-   - Namespace metadata and the arbiter show `DEGRADED` and `degraded_since`, with metrics and an alert.
+   - Namespace metadata and the control plane show `DEGRADED` and `degraded_since`, with metrics and an alert.
    - Sync transactions commit on local persist.
    - Async transactions behave as they always do.
 2. **B comes back** and first runs §4.5 rollback if it was the demoted leader. It then catches up as a *learner* through normal streaming, which can take a while after a long outage. If the backlog has passed retention, use force replication.
@@ -310,12 +319,12 @@ Throughput: commits are per shard and per lane prefix, so they batch naturally. 
 6. **Shard movement** inside a cluster: the commit tracker is rebuilt on shard load from persisted remote-reader acks (`AckedReplicationTaskIDs`). That's conservative and therefore safe.
 7. **Clients can see extra latency or timeouts while a peer is degraded.** That needs SLOs, plus metrics for commit lag per shard and lane.
 8. **Trigger choice is a product decision:** which event types are worth a quorum round trip. Start, Update accepted and completion are natural candidates. Activity started and heartbeats are expensive and rarely worth it.
-9. **Arbiter placement and ownership** for 2-cluster deployments (§5.3): a third-region witness or an external store, who operates it, and whether one arbiter serves all namespaces.
+9. **Control-plane requirements** (§5.3): confirm it gives linearizable CAS and survives the loss of either data region. Then pick the lease duration and `D` so that `D` + CAS latency is an acceptable pause, and the lease is short enough for a quick unclean promote.
 
 ## 9. Suggested phases
 
 1. **Observability only:** compute `commit[s][ℓ]`, event-driven acks, a durable-vs-progress watermark, and metrics for "would-be gating delay". No behavior change, but it measures the latency cost on real traffic.
 2. **Gating:** the sync-trigger policy and per-transaction classification (§3.6), persisted barrier, `CommitTracker`, the mutable-state gate in `LoadMutableState`, a lock-free push-on-commit replication sender, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1, G3 and G4, plus G2 for planned failovers.
 3. **Safe unplanned failover:** relay log, promote/fence RPCs, catch-up stream, rollback of the old leader, reapply off. This completes G2.
-   - **2-cluster track:** ISR mode, the arbiter record and its CAS operations, shrink/rejoin automation, the `DEGRADED` state and unclean promote (§5). This can ship before the majority-mode election, since ISR promotion needs no catch-up.
+   - **2-cluster track:** ISR mode, the control-plane record, its CAS operations and the degraded lease, shrink/rejoin automation, the `DEGRADED` state and unclean promote (§5). This can ship before the majority-mode election, since ISR promotion needs no catch-up.
 4. **Latency work:** group commit per workflow, the durable-ack mode, witness replicas.
