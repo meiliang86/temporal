@@ -7,6 +7,7 @@ Status: draft for discussion. Based on `temporalio/temporal` at `23e4eab` (2026-
 **Yes, this is feasible**, and Temporal already has most of the Raft building blocks. The work splits in two:
 
 - **The steady-state path is fairly easy.** "Hold every side effect until a majority acks" maps onto pieces that already exist. Every side effect already leaves through a transactional outbox (history task queues). Replication already acks per-shard watermarks back to the sender. Graceful failover already gates task executors.
+- **Uncommitted mutable state is invisible too, not only side effects.** No RPC, task or other transaction may read a workflow's mutable state until its last write is committed. The gate is the workflow lock: whoever holds it waits for commit before using the state (§3.3). This serializes writes per workflow at quorum speed, and the replication sender must stop needing the workflow lock, or it deadlocks against a writer waiting for the very commit it has to ship.
 - **Leader change is the hard part, and today's failover is not safe for it.** A majority-commit rule only means something if an unplanned failover never loses a committed write. Today that isn't guaranteed: with 3 clusters, the surviving clusters B and C can each hold committed writes the other lacks, on different shards. So you need four new pieces that Temporal doesn't have:
   - an election step that uses the failover version as the term,
   - fencing, so voters stop acking the old leader,
@@ -39,6 +40,7 @@ With N replica clusters and quorum Q = ⌊N/2⌋+1:
 - **G1 (durability):** Before Temporal makes any effect visible outside the active cluster, the state that produced it is durably applied on at least Q clusters, counting the active one. Visible effects include RPC success, task dispatch to a worker, a callback, a child start, a parent notification and a read result.
 - **G2 (RPO = 0 for any minority failure):** Losing up to N−Q clusters, including the active one, loses no write that anyone observed.
 - **G3 (no split-brain visibility):** A partitioned old leader can keep writing locally, but it can't make any of those writes visible, because it can't reach Q.
+- **G4 (no reads of uncommitted state):** Mutable state written by a transaction can't be observed until that transaction commits. That covers RPCs (reads and writes), queue tasks and later transactions on the same workflow. The only exception is the replication path itself, which has to read uncommitted state to ship it.
 - **Non-goal:** Linearizable behavior for writes that nobody observed. Uncommitted writes on a failed leader are discarded, like an uncommitted Raft log tail. A client whose RPC timed out must retry, which is already the contract today.
 
 Async and sync namespaces coexist on the same shards. The mode is a per-namespace replication-config field.
@@ -70,14 +72,38 @@ Required changes to ack semantics:
 Every transaction for a sync namespace records **`barrier = max replication-task ID created in this transaction`**. If the transaction created no replication task, the barrier is the previous one.
 
 - The barrier is stamped onto every other history task created in the same transaction (transfer, timer, outbound, visibility, CHASM): a new field, `ReplicationBarrier`.
-- Mutable state keeps `lastBarrier` in memory. It's set on write and on load (on load, use the max replication-task ID found for the execution, or conservatively the shard's current replication high watermark).
+- Mutable state **persists** the barrier in `ExecutionInfo` (new field `last_replication_barrier`), written in the same transaction. That way a load after cache eviction, host restart or shard movement knows exactly which commit it has to wait for.
 - The barrier is stamped explicitly instead of inferred from task ID order. IDs within a transaction come from one generator, but nothing guarantees replication tasks sort before the others, and the lane watermark only covers replication tasks.
 
 **Commit test:** `committed(x) ⇔ commit[s][ℓ] > x.barrier`.
 
 Each shard holds a `CommitTracker` with the current commit index per lane, plus a wait-list of waiters keyed by barrier. Each advance of `ack[p]` from `recvSyncReplicationState` wakes the waiters it satisfies.
 
-### 3.3 Gating side effects
+### 3.3 Uncommitted mutable state is invisible
+
+Today, once a transaction persists locally, the cached mutable state holds the new state, and the next lock holder sees it immediately. For sync namespaces, the **workflow lock becomes the visibility gate**. It works like a latch in a Raft-replicated database, held until the write is replicated.
+
+**Rule:** any code that holds the workflow lock may use the mutable state only once `committed(ms.lastBarrier)` is true. If it isn't, the holder waits, keeping the lock, until it is.
+
+How it works:
+
+1. **Writer.** Acquire the lock, load the (committed) state, apply the request, persist locally. Then **keep holding the lock** and wait for `committed(newBarrier)` before releasing it and responding. Every write therefore starts from committed state; nothing is built on top of an uncommitted predecessor.
+2. **Every other lock holder.** That means RPCs, queue tasks, timers, matching's `Record*TaskStarted` and CHASM. Enforce the check in one place: `workflow.ContextImpl.LoadMutableState` (`workflow/context.go:452`), and the equivalent for already-cached state. After the lock is acquired, it checks the barrier and waits if needed. This covers a writer whose deadline expired, which releases the lock with uncommitted state still in the cache, and a reload from the DB after eviction or shard movement (§3.2: the barrier is persisted).
+3. **Deadline while waiting.** The waiter returns `Unavailable` and releases the lock. The state stays marked pending through its barrier, so the next holder waits too. Nothing uncommitted leaks out on a timeout.
+4. **The replication sender is the only reader of uncommitted state, and it must never take the workflow lock.** Today the converter acquires the lock and calls `LoadMutableState` (`replication/raw_task_converter.go:434,620`). Under rule 1 that deadlocks: the writer holds the lock waiting for commit, while the sender waits for the lock to build the task that would produce the commit. The fix:
+   - **Push-on-commit is mandatory, not just an optimization.** The writer builds the replication payload (the versioned transition and events) inside its transaction and hands it straight to the stream sender.
+   - **The fallback path** (catch-up after a stream restart, cache miss) reads the persisted state from the DB without the lock. That's safe: whoever holds the lock is only waiting and doesn't mutate state until the commit arrives.
+   - The same lock-free, uncommitted-read exemption applies to the source side of follower resend and backfill (`GetWorkflowExecutionRawHistoryV2`, `SyncWorkflowState`), since those serve replication too.
+5. **Reads that bypass mutable state.** Each one must go through the gate before it answers:
+   - **The current-execution record**: `GetCurrentWorkflowRunID` (`api/consistency_checker.go:97`) and the start-workflow conflict path, which builds "already started" and dedup responses straight from `CurrentWorkflowConditionFailedError`. These must load that run's mutable state through the gate before responding. The alternative is to also persist the barrier on the current record.
+   - **History branch reads**: already bounded by `GetMutableState`'s next event ID (`api/getworkflowexecutionhistory/api.go:75`), so they're covered once that call is gated.
+   - **Visibility**: covered by the task gate in §3.4.
+   - Audit every other `executionManager.Get*` call in `service/history/api`.
+6. **Followers.** Before an election (§4.5), passive clusters can hold an old leader's uncommitted state. For sync namespaces, send every read to the active cluster through namespace forwarding instead of serving it locally.
+
+**Cost.** Writes to *one* workflow are fully serialized: each takes a local persist plus a quorum round trip. With a 30 ms round trip and about 10 ms of DB time, that caps a workflow at roughly 25 writes/s. This is an illustrative figure, not a measurement. Writes to different workflows still run in parallel, and shard-level ack waves batch them. Requests queued behind a pending write see longer lock waits, and so more `BusyWorkflow` / lock-timeout errors. A possible future fix is **group commit**: apply several queued requests for the same workflow in one transaction and pay the quorum round trip once.
+
+### 3.4 Gating side effects
 
 | Side effect | Path | Gate |
 |---|---|---|
@@ -89,13 +115,15 @@ Each shard holds a `CommitTracker` with the current commit index per lane, plus 
 | CHASM component tasks | CHASM queues | **Yes** |
 | **RPC responses**: Start, Signal, SignalWithStart, Update (accepted/completed), RespondWorkflowTaskCompleted (includes eager activities/WT), RespondActivityTask*, heartbeats, Reset, Terminate, Cancel, and dedup hits ("request ID already seen") | History handler | **Yes.** This is the most important gate: a success response *is* the side effect. |
 | `RecordWorkflowTaskStarted` / `RecordActivityTaskStarted` responses (the poll result returned to a worker) | History handler | **Yes in strict mode.** Otherwise a worker can run local activities or user code against an uncommitted signal that is later discarded. |
-| Reads: Describe, GetHistory (including the long poll used to fetch results), PollWorkflowExecutionUpdate, Query | History handler | **Yes**, read-index style: wait for `commit > lastBarrier` of the mutable state that was read. |
+| Reads: Describe, GetHistory (including the long poll used to fetch results), PollWorkflowExecutionUpdate, Query | History handler | **Yes.** Covered by §3.3: they can only ever load committed mutable state. |
+
+The queue-task check on the task's own barrier is kept even though §3.3 would block the executor anyway. It parks the task *before* it takes the workflow lock, instead of holding the lock while waiting.
 
 **RPC mechanism:** wrap the history handler. Each request context carries `maxObservedBarrier`. The workflow `Context` raises it on `LoadMutableState`, `CreateWorkflowExecution` and `UpdateWorkflowExecutionAsActive` (`workflow/context.go:452,569,758`). On success, the wrapper waits for `committed(maxObservedBarrier)` and then returns. That one hook covers every API, including dedup and read paths, without touching each handler. If the deadline expires, return `Unavailable`. The write is persisted locally, so a client retry with the same request ID hits the dedup path and waits again.
 
 **Matching and workers need no change.** Matching only ever sees tasks that came out of gated transfer tasks. Speculative workflow tasks and Update "admitted" state are in memory and never promised to be durable, so they stay as they are.
 
-### 3.4 No quorum
+### 3.5 No quorum
 
 The active cluster keeps accepting and persisting writes, but every gated effect waits, so the namespace is effectively unavailable (CP). Two knobs:
 
@@ -153,7 +181,8 @@ Namespace metadata stays asynchronously replicated, and that's fine. Safety come
 Added latency per gated effect ≈ **one round trip to the nearest peer, plus the target DB commit, plus streaming overhead**. To get close to that floor:
 
 - Event-driven acks (§3.1). This is mandatory.
-- **Push on commit:** after the local transaction commits, send the replication task straight from memory, including the converted payload. Fall back to the DB read path for catch-up only. Today's sender reads from the DB after a notification and converts on send.
+- **Push on commit** (required by §3.3, not optional): after the local transaction commits, send the replication task straight from memory, including the converted payload. Fall back to a lock-free DB read for catch-up only. Today's sender reads from the DB after a notification and converts on send, under the workflow lock.
+- **Per-workflow write rate** is bounded by local persist + quorum round trip (§3.3). Group commit is the main lever if that's too low.
 - Keep sync lanes separate from async lanes and from low-priority force-replication.
 - The fastest peer sets the commit index. Put one replica close to the active (same region, different AZ or cell, or a nearby region) for low latency, and one far away for disaster recovery.
 
@@ -170,15 +199,16 @@ Throughput: commits are per shard and per lane prefix, so they batch naturally. 
 ## 7. Risks and open questions
 
 1. **Head-of-line blocking:** one stuck or poison task on a sync lane stalls commit for every sync workflow on that shard, for that peer. With 3 replicas the other peer covers it. DLQ policy for sync lanes needs a decision: surface it as an availability incident, never drop it silently.
-2. **Uncommitted state is visible inside the active cluster:** later transactions on the same workflow build on uncommitted state. That's fine, because the log is a prefix order per shard, so if a later write commits, so does the earlier one. But every external-facing path must go through §3.3. A full inventory of handler APIs and CHASM components is needed.
-3. **Per-workflow active cluster** (`ActiveClusterName(routingKey)`, `namespace.go:193`): the term and the promise are really per (namespace, routing group). The design generalizes, but the promise state has to be keyed that way.
-4. **Cross-namespace effects** (a child or a Nexus call into an async namespace) are gated on the parent's commit only. The target namespace keeps its own guarantees.
-5. **Shard movement** inside a cluster: the commit tracker is rebuilt on shard load from persisted remote-reader acks (`AckedReplicationTaskIDs`). That's conservative and therefore safe.
-6. **Clients can see extra latency or timeouts while a peer is degraded.** That needs SLOs, plus metrics for commit lag per shard and lane.
+2. **Completeness of the mutable-state gate (§3.3):** any path that reads execution state without `LoadMutableState` leaks uncommitted state. Examples: direct persistence reads, the current-execution record, in-memory caches outside the workflow context, CHASM component reads. This needs a full inventory and a test hook that fails if uncommitted state is ever returned. In-memory-only structures (speculative workflow tasks, the Update registry's admitted state, the query registry) were never durable and stay out of scope.
+3. **Lock hold time:** workflow locks are now held across a cross-region round trip. Lock-wait timeouts, `BusyWorkflow` thresholds and the queue processors' lock-acquire behavior need retuning for sync namespaces.
+4. **Per-workflow active cluster** (`ActiveClusterName(routingKey)`, `namespace.go:193`): the term and the promise are really per (namespace, routing group). The design generalizes, but the promise state has to be keyed that way.
+5. **Cross-namespace effects** (a child or a Nexus call into an async namespace) are gated on the parent's commit only. The target namespace keeps its own guarantees.
+6. **Shard movement** inside a cluster: the commit tracker is rebuilt on shard load from persisted remote-reader acks (`AckedReplicationTaskIDs`). That's conservative and therefore safe.
+7. **Clients can see extra latency or timeouts while a peer is degraded.** That needs SLOs, plus metrics for commit lag per shard and lane.
 
 ## 8. Suggested phases
 
 1. **Observability only:** compute `commit[s][ℓ]`, event-driven acks, a durable-vs-progress watermark, and metrics for "would-be gating delay". No behavior change, but it measures the latency cost on real traffic.
-2. **Gating:** barrier stamping, `CommitTracker`, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1 and G3, plus G2 for planned failovers.
+2. **Gating:** persisted barrier, `CommitTracker`, the mutable-state gate in `LoadMutableState`, a lock-free push-on-commit replication sender, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1, G3 and G4, plus G2 for planned failovers.
 3. **Safe unplanned failover:** relay log, promote/fence RPCs, catch-up stream, rollback of the old leader, reapply off. This completes G2.
-4. **Latency work:** push-on-commit, the durable-ack mode, witness replicas.
+4. **Latency work:** group commit per workflow, the durable-ack mode, witness replicas.
