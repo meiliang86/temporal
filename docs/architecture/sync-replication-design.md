@@ -14,7 +14,10 @@ Status: draft for discussion. Based on `temporalio/temporal` at `23e4eab` (2026-
   - catch-up from the surviving peer before the new leader goes active,
   - rollback of the old leader's uncommitted tail when it comes back.
 
-You also need at least **3 replicas** for a sync namespace. With 2, any single failure stops progress.
+Two more options sit on top of this:
+
+- **Sync can be chosen per event type (§3.6).** A namespace lists which events trigger the sync path, for example only `WorkflowExecutionStarted`. A transaction containing one of those events waits for quorum. All other transactions take today's async path. Because the replication log is ordered, a committed sync transaction also makes every earlier async transaction in its lane durable.
+- **Two clusters with a degraded mode (§5).** Majority quorum needs 3 clusters, so with 2 any single failure stops progress. For 2 clusters, commit uses an *in-sync replica set* (ISR, the Kafka model) instead. A failed peer is removed from the set, the survivor keeps running in a degraded (effectively async) state, and the peer is added back once it has caught up. A dead peer and a network partition look the same from inside 2 clusters, so changes to the set must be recorded in a small **arbiter** outside both clusters. Without an arbiter, degradation still works, but every unplanned failover becomes a manual decision that accepts data loss.
 
 ## 1. How replication works today, mapped to Raft
 
@@ -35,7 +38,7 @@ So Temporal is already a leader-based replicated log. What's missing is the comm
 
 ## 2. Guarantees for a sync namespace
 
-With N replica clusters and quorum Q = ⌊N/2⌋+1:
+With N replica clusters and quorum Q = ⌊N/2⌋+1 (majority mode; §5 covers ISR mode). G1–G4 apply to *sync transactions*: every transaction when the namespace is fully sync, or only those containing a configured event type (§3.6).
 
 - **G1 (durability):** Before Temporal makes any effect visible outside the active cluster, the state that produced it is durably applied on at least Q clusters, counting the active one. Visible effects include RPC success, task dispatch to a worker, a callback, a child start, a parent notification and a read result.
 - **G2 (RPO = 0 for any minority failure):** Losing up to N−Q clusters, including the active one, loses no write that anyone observed.
@@ -43,7 +46,7 @@ With N replica clusters and quorum Q = ⌊N/2⌋+1:
 - **G4 (no reads of uncommitted state):** Mutable state written by a transaction can't be observed until that transaction commits. That covers RPCs (reads and writes), queue tasks and later transactions on the same workflow. The only exception is the replication path itself, which has to read uncommitted state to ship it.
 - **Non-goal:** Linearizable behavior for writes that nobody observed. Uncommitted writes on a failed leader are discarded, like an uncommitted Raft log tail. A client whose RPC timed out must retry, which is already the contract today.
 
-Async and sync namespaces coexist on the same shards. The mode is a per-namespace replication-config field.
+Async and sync namespaces coexist on the same shards. The mode, and the list of event types that trigger sync, are per-namespace replication-config fields.
 
 ## 3. Steady-state protocol
 
@@ -69,7 +72,7 @@ Required changes to ack semantics:
 
 ### 3.2 Commit barrier
 
-Every transaction for a sync namespace records **`barrier = max replication-task ID created in this transaction`**. If the transaction created no replication task, the barrier is the previous one.
+Every **sync transaction** (§3.6) records **`barrier = max replication-task ID created in this transaction`**. An async transaction, or one that created no replication task, keeps the previous barrier. Mutable state therefore tracks `lastSyncBarrier`, and the rest of this section calls it simply "the barrier".
 
 - The barrier is stamped onto every other history task created in the same transaction (transfer, timer, outbound, visibility, CHASM): a new field, `ReplicationBarrier`.
 - Mutable state **persists** the barrier in `ExecutionInfo` (new field `last_replication_barrier`), written in the same transaction. That way a load after cache eviction, host restart or shard movement knows exactly which commit it has to wait for.
@@ -105,6 +108,8 @@ How it works:
 
 ### 3.4 Gating side effects
 
+These gates apply to effects of **sync transactions** (§3.6). Effects of async transactions go out immediately, as they do today.
+
 | Side effect | Path | Gate |
 |---|---|---|
 | Activity/WT dispatch to matching, child start, signal/cancel external, parent close notification, reset, delete | Transfer queue | **Yes.** In `queues.Executable.Execute` (`queues/executable.go:282`), before the task executor runs, the same way `HANDOVER` is checked today. Park the task on the commit tracker instead of busy-retrying. |
@@ -128,7 +133,45 @@ The queue-task check on the task's own barrier is kept even though §3.3 would b
 The active cluster keeps accepting and persisting writes, but every gated effect waits, so the namespace is effectively unavailable (CP). Two knobs:
 
 - **Leader lease:** if there's been no quorum ack for `T`, reject new writes with `Unavailable` right away. This limits how much uncommitted tail builds up, which later has to be rolled back, and lets clients fail fast.
-- **Degrade to async**, as an explicit operator or policy action (like MySQL semi-sync fallback). It's recorded in namespace metadata so the RPO change can be audited. Never do this silently.
+- **Degrade to async**: in ISR mode (§5), drop the failed peer from the in-sync set through the arbiter and keep running in a degraded state. In majority mode with N≥3 this is an explicit operator action. Either way it's recorded so the RPO change can be audited, and it never happens silently.
+
+### 3.6 Selective sync per event type
+
+**Configuration.** The namespace replication config gets a sync policy: a set of **sync triggers**.
+
+- **History event types**, for example `WORKFLOW_EXECUTION_STARTED`, `WORKFLOW_EXECUTION_SIGNALED`, `WORKFLOW_EXECUTION_UPDATE_ACCEPTED`, `WORKFLOW_EXECUTION_COMPLETED`.
+- **Non-event transitions** that have no history event at the time they happen: activity started, activity heartbeat, CHASM component transitions. These are named as operation types.
+- An empty set means a fully async namespace. "All" means every transaction is sync, as in §3.1–3.4.
+
+**Classification is per transaction, not per event.** Temporal persists events in batches, so one transaction can hold several events. A transaction is sync if it contains *any* trigger. The decision belongs in close-transaction (`CloseTransactionAsMutation` / `AsSnapshot`), which sees every event and task in the transaction.
+
+- **Example:** the StartWorkflow transaction holds `WorkflowExecutionStarted` and `WorkflowTaskScheduled`. It's sync, so the client's run ID *and* the first workflow-task dispatch both wait for commit.
+- A `RespondWorkflowTaskCompleted` that only schedules activities is async.
+
+**Rules:**
+
+- **Sync transaction:** §3.2–3.4 apply in full. The barrier is stamped and persisted, and the response, the transaction's tasks and its mutable state all wait for commit.
+- **Async transaction:** no wait. The response and tasks go out immediately. Its tasks carry the workflow's current `lastSyncBarrier`, which was already committed when the state was loaded through the gate, so they never park.
+- **The mutable-state gate (§3.3) checks `lastSyncBarrier`**, and only sync transactions advance it. That has two consequences:
+  - State written by async transactions is visible immediately, as it is today.
+  - A *pending* sync write blocks everything on that workflow, async writes included, until it commits. Otherwise an async write's response or tasks would expose the sync write's uncommitted state.
+- **Free extra durability from ordering.** The replication log is ordered within each shard lane. When a sync transaction commits, every earlier transaction in that lane is durable too, including async ones and ones from other workflows.
+
+**Lane sharing.** Sync and async transactions of a namespace must stay in **one lane**, because per-workflow ordering requires it: event-based replication needs earlier events first. So a sync commit waits behind any async backlog ahead of it in the lane, and a burst of async traffic shows up as sync commit latency. Measure this in phase 1 (§9).
+
+**What failover guarantees per class.** Committed sync transactions have RPO = 0, and unplanned failover still needs §4 (election, fencing, catch-up) to protect them. Async transactions keep today's RPO, which equals the replication lag. When the old leader returns (§4.5), its uncommitted tail splits by class:
+
+- **Uncommitted transactions containing a sync trigger** are discarded. Their client never got an ack.
+- **Async-only transactions beyond the commit point** keep today's behavior: their events are reapplied to the new leader's branch. These may already have been visible, because async means visible immediately.
+
+So the reapply policy follows the trigger set.
+
+**Example policy: sync = {`WorkflowExecutionStarted`}.**
+
+- A Start is acknowledged only after quorum, so an acknowledged workflow can't disappear in a failover.
+- A retry with the same request ID returns only after that commit. It goes through the gate on `lastSyncBarrier`.
+- Everything later in the workflow is async. After an unplanned failover, the workflow may resume from an earlier point, but it exists.
+- Steady-state cost: one quorum wait per workflow start, and nothing per step.
 
 ## 4. Leader change (failover)
 
@@ -170,13 +213,74 @@ The catch-up gap is bounded by the replication lag between the two followers, no
 1. A gets `Fenced{vB}` from voters, or sees vB in namespace metadata, and becomes passive.
 2. **Truncate the uncommitted tail.** B returns the per-shard commit point it reached during catch-up. Every A replication task above that point is an uncommitted write. For each affected execution, A resyncs from B (`SyncWorkflowState`, `historyservice/v1/service.proto:429`). If the execution doesn't exist on B (an un-acked `StartWorkflow`), A deletes it locally (`ForceDeleteWorkflowExecution`).
 3. A's gated transfer, timer and outbound tasks for those transactions never committed, so they never ran. Discard them.
-4. **Turn off NDC event reapply for sync namespaces**, or make it a policy. Reapplying signals from the discarded branch would bring back writes that were never acknowledged. Raft semantics say they disappear and the client retries.
+4. **No NDC event reapply for uncommitted sync transactions.** Reapplying signals from the discarded branch would bring back writes that were never acknowledged. Raft semantics say they disappear and the client retries. Async-only transactions keep today's reapply behavior (§3.6).
 
 ### 4.6 Namespace metadata
 
 Namespace metadata stays asynchronously replicated, and that's fine. Safety comes from voters acking only the highest term they've promised, not from every cluster agreeing on `activeCluster` at the same moment. A cluster that wrongly thinks it's active simply can't commit.
 
-## 5. Performance
+## 5. Two clusters: in-sync replica set with degraded mode
+
+### 5.1 Why majority doesn't work with 2
+
+With N = 2, Q = 2: every commit needs both clusters, so either failure blocks all sync transactions (§3.5).
+
+### 5.2 In-sync replica (ISR) set
+
+In ISR mode the commit rule is **"acked by every member of the ISR"** instead of "acked by a majority of all replicas". The leader is always in the ISR.
+
+```
+commit[s][ℓ] = min over p ∈ ISR \ {leader} of ack[p][s][ℓ]      // +∞ if the ISR is just the leader
+```
+
+- **Healthy, ISR = {A, B}:** the same as majority mode with 2 clusters. Every sync transaction waits for B.
+- **B fails, ISR = {A}:** commit happens on local persist. The namespace is now **degraded**: sync transactions stop waiting, and the RPO for everything becomes async-level until B rejoins.
+- **Who can become leader:** only an ISR member can become leader without losing data. It has every committed write, because commit required its ack. That makes §4.4's catch-up unnecessary in ISR mode. Fencing (§4.3) still applies.
+
+This is Kafka's ISR model with `min.insync.replicas` as a knob, and close to MySQL semi-sync with fallback.
+
+### 5.3 Telling a dead peer from a partition needs an arbiter
+
+From inside 2 clusters, "B is dead" and "A and B are partitioned" look the same. Suppose A drops B on its own while B is only partitioned off, and failover automation promotes B. Now both clusters are active. Writes A committed while degraded are lost when the two reconcile, which is exactly what sync replication was supposed to prevent.
+
+So ISR membership and the epoch must live in a **replication arbiter**: a small linearizable compare-and-set (CAS) store outside both clusters' failure domains.
+
+- **Record**, per namespace or per routing group: `{epoch (failover version), leader, isr[], degraded_since, per-shard watermarks at shrink time}`.
+- **Implementation options:**
+  - a witness: a minimal Temporal deployment (frontend plus DB, no workflow data) in a third region,
+  - or an external consensus store: etcd, Spanner, or a strongly consistent DynamoDB table.
+- **Arbiter outage** blocks only *membership changes* (shrink, rejoin, failover), never steady-state commits.
+
+The rules, all serialized by CAS on the arbiter:
+
+| Action | Who | Condition | Effect |
+|---|---|---|---|
+| **Shrink** | Leader A | B's acks haven't moved on any sync lane with pending waiters for `D` (e.g. 10–30 s), or its stream has been down for `D` | CAS `isr {A,B} → {A}` at epoch e. Only once it succeeds may A commit without B. Waiters held at that moment are released. |
+| **Promote** | Candidate B | B ∈ isr at the current epoch | CAS `epoch e → e', leader = B, isr = {B}` (A is unreachable). B starts degraded. |
+| **Rejoin** | Leader A | B is caught up (§5.4) | CAS `isr {A} → {A,B}` at the same epoch. |
+| **Unclean promote** | Operator only | B ∉ isr (the leader died while degraded) | Promote B anyway, accepting loss of A's writes since `degraded_since`. The arbiter reports the exact per-shard window. Never automatic. |
+
+Shrink and Promote race through the arbiter, so exactly one wins. If A's shrink wins, B is no longer eligible. If B's promotion wins, A's shrink CAS fails, and A learns it has been demoted; B's voters also fence A, as in §4.3. Cost of a peer failure: one blip of about `D` + CAS latency on sync transactions, then normal operation in the degraded state.
+
+**Without an arbiter**, A can still shrink on its own, since its local DB is the only record. But B can then never be promoted automatically: it can't know whether it was dropped. Every unplanned failover becomes an operator-confirmed unclean promote. That's safe, but recovery time depends on a human.
+
+### 5.4 Degraded state and recovery
+
+1. **While degraded:**
+   - Namespace metadata and the arbiter show `DEGRADED` and `degraded_since`, with metrics and an alert.
+   - Sync transactions commit on local persist.
+   - Async transactions behave as they always do.
+2. **B comes back** and first runs §4.5 rollback if it was the demoted leader. It then catches up as a *learner* through normal streaming, which can take a while after a long outage. If the backlog has passed retention, use force replication.
+3. **Rejoin** when B's ack lag is below a threshold on *every* shard of the namespace's sync lanes, for example under 1,000 tasks or under 500 ms. A then does the rejoin CAS. From then on, new sync transactions wait for B again. The remaining small lag shows up as a one-time latency bump. There's no correctness risk, because B must ack everything up to each barrier anyway. An optional handover-style pause can drain the lag to zero first.
+4. Until the rejoin CAS succeeds, B is not eligible for promotion.
+
+### 5.5 Configuration and N ≥ 3
+
+- `quorum_mode: MAJORITY | ISR`, and `min_isr` (2 = never degrade, i.e. strict; 1 = degrade down to the leader alone).
+- ISR mode also works for N ≥ 3, but commit then waits for the *slowest* ISR member. Majority waits for the fastest Q−1. Recommended default: MAJORITY for N ≥ 3 (the replica set is its own arbiter), ISR for N = 2.
+- Degradation only changes behavior for sync transactions. Async transactions never waited.
+
+## 6. Performance
 
 Added latency per gated effect ≈ **one round trip to the nearest peer, plus the target DB commit, plus streaming overhead**. To get close to that floor:
 
@@ -190,13 +294,13 @@ Added latency per gated effect ≈ **one round trip to the nearest peer, plus th
 
 Throughput: commits are per shard and per lane prefix, so they batch naturally. A busy shard pays one round trip per ack wave, not one per write.
 
-## 6. Membership changes
+## 7. Membership changes
 
 - A cluster added to a sync namespace joins as a **learner**: it receives replication but isn't counted in Q. It becomes a voter once force replication finishes and it's within lag. The gradual-connect ramp already exists.
 - Change membership one cluster at a time, or use joint consensus. Q and the voter set are versioned in namespace metadata, and every prepare and promise carries that version.
 - A cheaper third replica could be a **witness** that stores relay and replication payloads but runs no workers. Catch-up could stream from it. This is future work.
 
-## 7. Risks and open questions
+## 8. Risks and open questions
 
 1. **Head-of-line blocking:** one stuck or poison task on a sync lane stalls commit for every sync workflow on that shard, for that peer. With 3 replicas the other peer covers it. DLQ policy for sync lanes needs a decision: surface it as an availability incident, never drop it silently.
 2. **Completeness of the mutable-state gate (§3.3):** any path that reads execution state without `LoadMutableState` leaks uncommitted state. Examples: direct persistence reads, the current-execution record, in-memory caches outside the workflow context, CHASM component reads. This needs a full inventory and a test hook that fails if uncommitted state is ever returned. In-memory-only structures (speculative workflow tasks, the Update registry's admitted state, the query registry) were never durable and stay out of scope.
@@ -205,10 +309,13 @@ Throughput: commits are per shard and per lane prefix, so they batch naturally. 
 5. **Cross-namespace effects** (a child or a Nexus call into an async namespace) are gated on the parent's commit only. The target namespace keeps its own guarantees.
 6. **Shard movement** inside a cluster: the commit tracker is rebuilt on shard load from persisted remote-reader acks (`AckedReplicationTaskIDs`). That's conservative and therefore safe.
 7. **Clients can see extra latency or timeouts while a peer is degraded.** That needs SLOs, plus metrics for commit lag per shard and lane.
+8. **Trigger choice is a product decision:** which event types are worth a quorum round trip. Start, Update accepted and completion are natural candidates. Activity started and heartbeats are expensive and rarely worth it.
+9. **Arbiter placement and ownership** for 2-cluster deployments (§5.3): a third-region witness or an external store, who operates it, and whether one arbiter serves all namespaces.
 
-## 8. Suggested phases
+## 9. Suggested phases
 
 1. **Observability only:** compute `commit[s][ℓ]`, event-driven acks, a durable-vs-progress watermark, and metrics for "would-be gating delay". No behavior change, but it measures the latency cost on real traffic.
-2. **Gating:** persisted barrier, `CommitTracker`, the mutable-state gate in `LoadMutableState`, a lock-free push-on-commit replication sender, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1, G3 and G4, plus G2 for planned failovers.
+2. **Gating:** the sync-trigger policy and per-transaction classification (§3.6), persisted barrier, `CommitTracker`, the mutable-state gate in `LoadMutableState`, a lock-free push-on-commit replication sender, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1, G3 and G4, plus G2 for planned failovers.
 3. **Safe unplanned failover:** relay log, promote/fence RPCs, catch-up stream, rollback of the old leader, reapply off. This completes G2.
+   - **2-cluster track:** ISR mode, the arbiter record and its CAS operations, shrink/rejoin automation, the `DEGRADED` state and unclean promote (§5). This can ship before the majority-mode election, since ISR promotion needs no catch-up.
 4. **Latency work:** group commit per workflow, the durable-ack mode, witness replicas.
