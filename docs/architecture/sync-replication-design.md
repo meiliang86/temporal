@@ -260,7 +260,7 @@ So ISR membership and the epoch must live outside both clusters. **The control p
 | **Shrink** | Control plane, at A's request or from its own probes | B's acks haven't moved on any sync lane with pending waiters for `D` (e.g. 10–30 s), or its stream has been down for `D` | CAS `isr {A,B} → {A}` at epoch e, and grant A a **degraded lease**. Only after A sees the CAS succeed may it commit without B. Waiters held at that moment are released. |
 | **Lease renewal** | A | A is degraded | A renews periodically, for example every lease/3. If A can't renew before the lease expires, by its own monotonic clock with a drift margin, it stops accepting writes for the group's namespaces. Behavior is the same as `HANDOVER` today. |
 | **Promote** | Control plane | B ∈ isr at the current epoch, and A is unhealthy | CAS `epoch e → e', leader = B, isr = {B}`. B fences A (§4.3) as soon as it learns of the promotion, then starts degraded with its own lease. |
-| **Rejoin** | Control plane, at A's request | B is caught up (§5.4) | CAS `isr {A} → {A,B}` at the same epoch. The degraded lease ends. |
+| **Rejoin** | Control plane, at A's request | B is caught up (§5.5) | Two steps (§5.4): A first confirms that it waits for B again, then the CAS `isr {A} → {A,B}` at the same epoch. The degraded lease ends. |
 | **Unclean promote** | Operator through the control plane, never automatic | B ∉ isr (A died while degraded) | Allowed only **after A's degraded lease has expired**. Promotes B and accepts loss of A's writes since `degraded_since`. The control plane reports the exact per-shard window. |
 
 **Why this is safe:**
@@ -273,17 +273,55 @@ So ISR membership and the epoch must live outside both clusters. **The control p
 
 **Majority mode (N ≥ 3)** can also be driven by the control plane: it picks the candidate and runs §4.3's prepare round. There, safety comes from the voters' promises, not from the control plane record.
 
-### 5.4 Degraded state and recovery
+### 5.4 Making a decision take effect in both clusters
+
+The control plane's central DB serializes every decision. But a decision changes nothing until the clusters apply it, so there's always a window between "committed in the control plane DB" and "applied in A and B". The design has to be safe throughout that window. It also has to be safe when one cluster can't be reached at all, which is the normal case during a failure.
+
+**Two views, read for different purposes:**
+
+- **Eligibility for promotion** is read *only* from the control plane DB. Only the control plane promotes, so a cluster's local, possibly stale copy never decides whether it may become leader.
+- **The commit rule** (wait for B or not) is read *only* from the leader cluster's applied copy. The control plane never commits writes.
+
+Every operation is ordered so that **both views are conservative at every moment**:
+
+- **Loosening the leader's commit rule** (shrink: stop waiting for B) is committed in the control plane DB **first** and applied at A **second**. While A hasn't applied it, A still waits for B: stricter than needed, never unsafe.
+- **Tightening the commit rule** (rejoin: wait for B again) is applied and confirmed at A **first**. Only then does the control plane DB make B eligible. If it ran the other way, the control plane could cleanly promote B while A was still committing alone.
+- **A promotion** depends on fencing, not on notifying the old leader. B applies the new epoch, which fences A's stream, before it accepts any write. A may be unreachable and never hear about it. Its sync commits are blocked by B's fence (healthy mode) or stopped by its own lease (degraded mode).
+
+| Operation | Order |
+|---|---|
+| **Shrink** | 1. CAS in the control plane DB: `isr={A}`, grant lease. 2. Push to A. 3. Each A shard commits without B only after it sees the new record. B doesn't need to be told. |
+| **Lease renewal** | A calls the control plane, which checks the epoch in its DB and extends `lease_expiry`. If the epoch has moved on, the renewal fails, and A stops degraded commits and demotes itself. |
+| **Clean promote** (B ∈ isr) | 1. CAS: `epoch e→e', leader=B`. 2. Push to B. B's hosts apply fencing and activation from the *same* record, so any host that accepts writes as leader is already fencing A. 3. Push to A when reachable, which demotes it (§4.5). |
+| **Unclean promote** (B ∉ isr) | 1. The control plane waits until its clock is past A's `lease_expiry` in its DB, plus a skew margin. 2. CAS. 3. Push to B as above. |
+| **Rejoin** | 1. CAS: `joining=B` (B still not eligible). 2. Push to A. 3. **Every** A shard confirms it now waits for B. 4. CAS: `isr={A,B}`, lease cleared. |
+
+**Applying to a cluster:**
+
+- **A new admin API**, for example `ApplyReplicationGroupState{group, version, epoch, leader, isr, joining, lease_expiry}`. The cluster stores it with a CAS on `version` in its own DB, so stale or duplicate pushes are ignored, and returns the applied version.
+- **The control plane runs a reconcile loop:** desired version in its DB, observed version per cluster, retry until they match. Each operation's status shows "committed", "applied at A" and "applied at B".
+- **Keep this record out of namespace replication.** It must not flow through the namespace replication queue: one cluster could overwrite the other with a stale copy. It belongs in a separate per-cluster record that only the control plane writes.
+- **Getting it to history hosts:** they pick it up like namespace metadata. The registry refresh interval is 2 s today (`system.namespaceCacheRefreshInterval`). A push notification after the admin API write cuts that delay. Delay only slows operations down; it never breaks safety, thanks to the ordering above.
+- **Per-shard confirmation** (needed for rejoin step 3): each shard persists the record version it has applied in its shard info. The cluster reports the minimum over all shards. A shard that loads onto a new host refuses a registry snapshot older than its persisted version and waits for a refresh. Without that, shard movement could take a shard back to "don't wait for B" after the control plane has made B eligible.
+
+**Lease timing across machines.** A's history hosts check the lease against wall-clock time:
+
+- A host's deadline is `lease_expiry − skew_margin`, where `lease_expiry` comes from the control plane's renewal response.
+- The control plane starts an unclean promote only after `lease_expiry + skew_margin` by its own clock.
+- With clock skew bounded by NTP, A has stopped committing alone before B starts.
+- A host that can't get a fresh record stops at its last known deadline.
+
+### 5.5 Degraded state and recovery
 
 1. **While degraded:**
    - Namespace metadata and the control plane show `DEGRADED` and `degraded_since`, with metrics and an alert.
    - Sync transactions commit on local persist.
    - Async transactions behave as they always do.
 2. **B comes back** and first runs §4.5 rollback if it was the demoted leader. It then catches up as a *learner* through normal streaming, which can take a while after a long outage. If the backlog has passed retention, use force replication.
-3. **Rejoin** when B's ack lag is below a threshold on *every* shard of the namespace's sync lanes, for example under 1,000 tasks or under 500 ms. A then does the rejoin CAS. From then on, new sync transactions wait for B again. The remaining small lag shows up as a one-time latency bump. There's no correctness risk, because B must ack everything up to each barrier anyway. An optional handover-style pause can drain the lag to zero first.
+3. **Rejoin** when B's ack lag is below a threshold on *every* shard of the namespace's sync lanes, for example under 1,000 tasks or under 500 ms. The control plane then runs the two-step rejoin (§5.4). From then on, new sync transactions wait for B again. The remaining small lag shows up as a one-time latency bump. There's no correctness risk, because B must ack everything up to each barrier anyway. An optional handover-style pause can drain the lag to zero first.
 4. Until the rejoin CAS succeeds, B is not eligible for promotion.
 
-### 5.5 Configuration and N ≥ 3
+### 5.6 Configuration and N ≥ 3
 
 - `quorum_mode: MAJORITY | ISR`, and `min_isr` (2 = never degrade, i.e. strict; 1 = degrade down to the leader alone).
 - ISR mode also works for N ≥ 3, but commit then waits for the *slowest* ISR member. Majority waits for the fastest Q−1. Recommended default: MAJORITY for N ≥ 3 (the replica set is its own arbiter), ISR for N = 2.
@@ -326,5 +364,5 @@ Throughput: commits are per shard and per lane prefix, so they batch naturally. 
 1. **Observability only:** compute `commit[s][ℓ]`, event-driven acks, a durable-vs-progress watermark, and metrics for "would-be gating delay". No behavior change, but it measures the latency cost on real traffic.
 2. **Gating:** the sync-trigger policy and per-transaction classification (§3.6), persisted barrier, `CommitTracker`, the mutable-state gate in `LoadMutableState`, a lock-free push-on-commit replication sender, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1, G3 and G4, plus G2 for planned failovers.
 3. **Safe unplanned failover:** relay log, promote/fence RPCs, catch-up stream, rollback of the old leader, reapply off. This completes G2.
-   - **2-cluster track:** ISR mode, the control-plane record, its CAS operations and the degraded lease, shrink/rejoin automation, the `DEGRADED` state and unclean promote (§5). This can ship before the majority-mode election, since ISR promotion needs no catch-up.
+   - **2-cluster track:** ISR mode, the control-plane record, its CAS operations and the degraded lease, the `ApplyReplicationGroupState` admin API with per-shard applied versions and the reconcile loop, shrink/rejoin automation, the `DEGRADED` state and unclean promote (§5). This can ship before the majority-mode election, since ISR promotion needs no catch-up.
 4. **Latency work:** group commit per workflow, the durable-ack mode, witness replicas.
