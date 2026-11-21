@@ -34,6 +34,7 @@ Agreed scope for the first implementation. Later sections describe the full desi
   - every duplicate-detection key lives in replicated mutable state (audit required),
   - an uncommitted write discarded at failover executes fresh on the new active.
 - **Rollback is per workflow.** A pending sync write blocks everything behind it, so each workflow's uncommitted tail on the old active is well defined. With everything sync, the whole tail is uncommitted sync writes, and it is discarded.
+- **The control plane is push-only.** It calls the data plane: `ApplyReplicationGroupState` for decisions and lease renewals, plus health, lag and applied-version reads. The data plane never calls the control plane.
 - **Failure detection is external.** The failure detector and the control plane make all membership and failover decisions, including human overrides, through the control plane's serialized record (§5.3–5.4). The data plane keeps only local safety reflexes: stop when the lease expires, demote when fenced, return `Unavailable` on a quorum-wait timeout.
 
 ## 1. How replication works today, mapped to Raft
@@ -266,7 +267,9 @@ So ISR membership and the epoch must live outside both clusters. **The control p
 
 1. **A linearizable compare-and-set (CAS) record** per replication group: `{epoch (failover version), leader, isr[], degraded_since, per-shard watermarks at shrink time, degraded lease}`. Key it per cluster pair, with the list of sync namespaces it covers. Then one CAS degrades every affected namespace when a cluster fails, instead of one per namespace. Per-namespace or per-routing-group keys are possible if a finer grain is needed.
 2. **A failure domain independent of both data clusters.** It must not live only in A's or B's region. It has to stay up when either region is down.
-3. **Reachability from both clusters' history services**, directly or through a cluster-local agent.
+3. **Push-only interaction: the control plane calls the data plane, never the reverse.** The control plane must reach each cluster's admin endpoint. The data plane exposes:
+   - `ApplyReplicationGroupState` (§5.4), which also carries lease renewals,
+   - read APIs for health, per-shard ack lag, stream state and applied record versions, used by the failure detector and by the rejoin check.
 4. **No part in the hot path.** It's used only for shrink, rejoin, promote and lease renewals. If the control plane is down, steady-state commits continue. Only membership changes and failovers wait.
 5. **A durable audit log** of degraded windows and unclean promotes, so the RPO exposure is always known.
 
@@ -274,10 +277,10 @@ So ISR membership and the epoch must live outside both clusters. **The control p
 
 | Action | Decided by | Condition | Effect |
 |---|---|---|---|
-| **Shrink** | Control plane, at A's request or from its own probes | B's acks haven't moved on any sync lane with pending waiters for `D` (e.g. 10–30 s), or its stream has been down for `D` | CAS `isr {A,B} → {A}` at epoch e, and grant A a **degraded lease**. Only after A sees the CAS succeed may it commit without B. Waiters held at that moment are released. |
-| **Lease renewal** | A | A is degraded | A renews periodically, for example every lease/3. If A can't renew before the lease expires, by its own monotonic clock with a drift margin, it stops accepting writes for the group's namespaces. Behavior is the same as `HANDOVER` today. |
+| **Shrink** | Control plane, from the lag and stream state it reads from A, plus its own probes | B's acks haven't moved on any sync lane with pending waiters for `D` (e.g. 10–30 s), or its stream has been down for `D` | CAS `isr {A,B} → {A}` at epoch e, and grant A a **degraded lease**. Only after A sees the CAS succeed may it commit without B. Waiters held at that moment are released. |
+| **Lease renewal** | Control plane | A is degraded, and the epoch in its DB is unchanged | The control plane pushes a new `lease_expiry` to A periodically, for example every lease/3. If no renewal arrives before the lease expires (expiry minus a skew margin), A stops accepting writes for the group's namespaces. Behavior is the same as `HANDOVER` today. |
 | **Promote** | Control plane | B ∈ isr at the current epoch, and A is unhealthy | CAS `epoch e → e', leader = B, isr = {B}`. B fences A (§4.3) as soon as it learns of the promotion, then starts degraded with its own lease. |
-| **Rejoin** | Control plane, at A's request | B is caught up (§5.5) | Two steps (§5.4): A first confirms that it waits for B again, then the CAS `isr {A} → {A,B}` at the same epoch. The degraded lease ends. |
+| **Rejoin** | Control plane, when B's lag read from A is under the threshold | B is caught up (§5.5) | Two steps (§5.4): A first confirms that it waits for B again, then the CAS `isr {A} → {A,B}` at the same epoch. The degraded lease ends. |
 | **Unclean promote** | Operator through the control plane, never automatic | B ∉ isr (A died while degraded) | Allowed only **after A's degraded lease has expired**. Promotes B and accepts loss of A's writes since `degraded_since`. The control plane reports the exact per-shard window. |
 
 **Why this is safe:**
@@ -308,7 +311,7 @@ Every operation is ordered so that **both views are conservative at every moment
 | Operation | Order |
 |---|---|
 | **Shrink** | 1. CAS in the control plane DB: `isr={A}`, grant lease. 2. Push to A. 3. Each A shard commits without B only after it sees the new record. B doesn't need to be told. |
-| **Lease renewal** | A calls the control plane, which checks the epoch in its DB and extends `lease_expiry`. If the epoch has moved on, the renewal fails, and A stops degraded commits and demotes itself. |
+| **Lease renewal** | The control plane extends `lease_expiry` in its DB, but only while the epoch is unchanged, then pushes it to A. Once the epoch moves on, renewals stop, and A's lease runs out. A push carrying a newer epoch demotes A right away. |
 | **Clean promote** (B ∈ isr) | 1. CAS: `epoch e→e', leader=B`. 2. Push to B. B's hosts apply fencing and activation from the *same* record, so any host that accepts writes as leader is already fencing A. 3. Push to A when reachable, which demotes it (§4.5). |
 | **Unclean promote** (B ∉ isr) | 1. The control plane waits until its clock is past A's `lease_expiry` in its DB, plus a skew margin. 2. CAS. 3. Push to B as above. |
 | **Rejoin** | 1. CAS: `joining=B` (B still not eligible). 2. Push to A. 3. **Every** A shard confirms it now waits for B. 4. CAS: `isr={A,B}`, lease cleared. |
@@ -323,7 +326,7 @@ Every operation is ordered so that **both views are conservative at every moment
 
 **Lease timing across machines.** A's history hosts check the lease against wall-clock time:
 
-- A host's deadline is `lease_expiry − skew_margin`, where `lease_expiry` comes from the control plane's renewal response.
+- A host's deadline is `lease_expiry − skew_margin`, where `lease_expiry` comes from the latest renewal pushed by the control plane. Renewals advance only `lease_expiry`, which is monotonic, not the record version. A stale or reordered renewal is ignored.
 - The control plane starts an unclean promote only after `lease_expiry + skew_margin` by its own clock.
 - With clock skew bounded by NTP, A has stopped committing alone before B starts.
 - A host that can't get a fresh record stops at its last known deadline.
