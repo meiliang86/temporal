@@ -19,6 +19,23 @@ Two more options sit on top of this:
 - **Sync can be chosen per event type (§3.6).** A namespace lists which events trigger the sync path, for example only `WorkflowExecutionStarted`. A transaction containing one of those events waits for quorum. All other transactions take today's async path. Because the replication log is ordered, a committed sync transaction also makes every earlier async transaction in its lane durable.
 - **Two clusters with a degraded mode (§5).** Majority quorum needs 3 clusters, so with 2 any single failure stops progress. For 2 clusters, commit uses an *in-sync replica set* (ISR, the Kafka model) instead. A failed peer is removed from the set, the survivor keeps running in a degraded (effectively async) state, and the peer is added back once it has caught up. A dead peer and a network partition look the same from inside 2 clusters, so changes to the set are made through the **control plane**, which acts as the arbiter: a CAS record of epoch, leader and in-sync set, plus a lease that the active must hold while degraded.
 
+## v1 decisions
+
+Agreed scope for the first implementation. Later sections describe the full design. Where they differ, this list wins for v1.
+
+- **Everything is sync.** For a sync namespace, every transaction waits for quorum: a fixed sync policy of "all". Per-event-type triggers (§3.6) are deferred. The config shape and the per-transaction classification hook are kept so they can be added later without a migration. Effects for v1:
+  - every transaction stamps and persists the barrier,
+  - no async transactions in a sync namespace,
+  - no mixed rollback: every uncommitted transaction on a returning old active is discarded, and NDC event reapply is turned off for sync namespaces.
+- **Namespace-level only.** Sync mode is refused for namespaces whose active cluster is resolved per business ID or routing key. Epoch, in-sync set, lease and fencing are all per namespace.
+- **Strong consistency on the workflow.** A pending sync write blocks all access to that workflow (§3.3), reads included.
+- **A quorum-wait timeout returns `Unavailable`.** A retry must return the original result. That requires:
+  - the duplicate-request check waits on the same commit through the gate,
+  - every duplicate-detection key lives in replicated mutable state (audit required),
+  - an uncommitted write discarded at failover executes fresh on the new active.
+- **Rollback is per workflow.** A pending sync write blocks everything behind it, so each workflow's uncommitted tail on the old active is well defined. With everything sync, the whole tail is uncommitted sync writes, and it is discarded.
+- **Failure detection is external.** The failure detector and the control plane make all membership and failover decisions, including human overrides, through the control plane's serialized record (§5.3–5.4). The data plane keeps only local safety reflexes: stop when the lease expires, demote when fenced, return `Unavailable` on a quorum-wait timeout.
+
 ## 1. How replication works today, mapped to Raft
 
 | Raft concept | Temporal today | Where |
