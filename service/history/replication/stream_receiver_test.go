@@ -838,3 +838,15 @@ func (s *mockScheduler) TrySubmit(task TrackableExecutableTask) bool {
 
 func (s *mockScheduler) Start() {}
 func (s *mockScheduler) Stop()  {}
+
+func TestAckNotifyingTask(t *testing.T) {
+	controller := gomock.NewController(t)
+	inner := NewMockTrackableExecutableTask(controller)
+	inner.EXPECT().Ack()
+	notified := 0
+	task := ackNotifyingTask{TrackableExecutableTask: inner, notify: func() { notified++ }}
+	task.Ack()
+	if notified != 1 {
+		t.Fatalf("expected one ack notification, got %d", notified)
+	}
+}

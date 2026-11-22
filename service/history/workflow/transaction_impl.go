@@ -19,6 +19,7 @@ import (
 	"go.temporal.io/server/service/history/events"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/notification"
+	"go.temporal.io/server/service/history/tasks"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -413,6 +414,16 @@ func createWorkflowExecution(
 			),
 		)
 	}
+	waitErr := waitForSyncReplication(
+		ctx,
+		shardContext,
+		request.NewWorkflowSnapshot.ExecutionInfo.NamespaceId,
+		request.NewWorkflowSnapshot.ExecutionInfo.WorkflowId,
+		request.NewWorkflowSnapshot.Tasks,
+	)
+	if waitErr != nil {
+		return nil, waitErr
+	}
 	return resp, nil
 }
 
@@ -472,6 +483,23 @@ func conflictResolveWorkflowExecution(
 				isWorkflow,
 			),
 		)
+	}
+	taskMaps := []map[tasks.Category][]tasks.Task{request.ResetWorkflowSnapshot.Tasks}
+	if request.NewWorkflowSnapshot != nil {
+		taskMaps = append(taskMaps, request.NewWorkflowSnapshot.Tasks)
+	}
+	if request.CurrentWorkflowMutation != nil {
+		taskMaps = append(taskMaps, request.CurrentWorkflowMutation.Tasks)
+	}
+	waitErr := waitForSyncReplication(
+		ctx,
+		shardContext,
+		request.ResetWorkflowSnapshot.ExecutionInfo.NamespaceId,
+		request.ResetWorkflowSnapshot.ExecutionInfo.WorkflowId,
+		taskMaps...,
+	)
+	if waitErr != nil {
+		return nil, waitErr
 	}
 	return resp, nil
 }
@@ -565,6 +593,20 @@ func updateWorkflowExecution(
 		)
 	}
 
+	taskMaps := []map[tasks.Category][]tasks.Task{request.UpdateWorkflowMutation.Tasks}
+	if request.NewWorkflowSnapshot != nil {
+		taskMaps = append(taskMaps, request.NewWorkflowSnapshot.Tasks)
+	}
+	waitErr := waitForSyncReplication(
+		ctx,
+		shardContext,
+		request.UpdateWorkflowMutation.ExecutionInfo.NamespaceId,
+		request.UpdateWorkflowMutation.ExecutionInfo.WorkflowId,
+		taskMaps...,
+	)
+	if waitErr != nil {
+		return nil, waitErr
+	}
 	return resp, nil
 }
 
@@ -585,6 +627,16 @@ func setWorkflowExecution(
 			tag.Error(err),
 		)
 		return nil, err
+	}
+	waitErr := waitForSyncReplication(
+		ctx,
+		shardContext,
+		request.SetWorkflowSnapshot.ExecutionInfo.NamespaceId,
+		request.SetWorkflowSnapshot.ExecutionInfo.WorkflowId,
+		request.SetWorkflowSnapshot.Tasks,
+	)
+	if waitErr != nil {
+		return nil, waitErr
 	}
 	return resp, nil
 }

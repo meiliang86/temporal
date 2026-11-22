@@ -61,6 +61,9 @@ type (
 		receiverMode      ReceiverMode
 		flowController    ReceiverFlowController
 		recvSignalChan    chan struct{}
+		// ackSignalChan is signaled when tracked tasks complete or the watermark advances, so
+		// the ack loop can acknowledge eagerly (ReplicationStreamEagerSyncStatusInterval).
+		ackSignalChan chan struct{}
 
 		slowSubmissionMu         sync.RWMutex
 		slowSubmissionTimestamps map[enumsspb.TaskPriority]time.Time
@@ -69,6 +72,12 @@ type (
 	executeInterceptedTask struct {
 		TrackableExecutableTask
 		execute func() error
+	}
+
+	// ackNotifyingTask signals the receiver's ack loop once the wrapped task is acked.
+	ackNotifyingTask struct {
+		TrackableExecutableTask
+		notify func()
 	}
 
 	// memberLane is the receiver-side state of one isolated namespace's lane.
@@ -86,6 +95,11 @@ type (
 
 func (t executeInterceptedTask) Execute() error {
 	return t.execute()
+}
+
+func (t ackNotifyingTask) Ack() {
+	t.TrackableExecutableTask.Ack()
+	t.notify()
 }
 
 func NewClusterShardKey(
@@ -133,6 +147,7 @@ func NewStreamReceiver(
 		receiverMode:             ReceiverModeUnset,
 		slowSubmissionTimestamps: make(map[enumsspb.TaskPriority]time.Time),
 		recvSignalChan:           make(chan struct{}, 1),
+		ackSignalChan:            make(chan struct{}, 1),
 	}
 	taskTrackerMap := make(map[enumsspb.TaskPriority]FlowControlSignalProvider)
 	taskTrackerMap[enumsspb.TASK_PRIORITY_HIGH] = func() *FlowControlSignal {
@@ -232,21 +247,58 @@ func (r *StreamReceiverImpl) sendEventLoop() error {
 	defer timer.Stop()
 
 	var inclusiveLowWatermark int64
+	ack := func() error {
+		watermark, err := r.ackMessage(r.stream)
+		if err != nil {
+			return err
+		}
+		if watermark != inclusiveLowWatermark {
+			inclusiveLowWatermark = watermark
+			r.logger.Debug(fmt.Sprintf("StreamReceiver acked inclusiveLowWatermark %d", inclusiveLowWatermark))
+		}
+		return nil
+	}
+
+	// With eager acknowledgement, a completion arms a short timer so that completions within the
+	// interval are coalesced into one acknowledgement.
+	var eagerAckTimer *time.Timer
+	var eagerAckC <-chan time.Time
+	defer func() {
+		if eagerAckTimer != nil {
+			eagerAckTimer.Stop()
+		}
+	}()
 
 	for {
 		select {
 		case <-timer.C:
-			watermark, err := r.ackMessage(r.stream)
-			if err != nil {
+			if err := ack(); err != nil {
 				return err
 			}
-			if watermark != inclusiveLowWatermark {
-				inclusiveLowWatermark = watermark
-				r.logger.Debug(fmt.Sprintf("StreamReceiver acked inclusiveLowWatermark %d", inclusiveLowWatermark))
+		case <-r.ackSignalChan:
+			if eagerAckC != nil {
+				continue
+			}
+			if interval := r.Config.ReplicationStreamEagerSyncStatusInterval(); interval > 0 {
+				eagerAckTimer = time.NewTimer(interval)
+				eagerAckC = eagerAckTimer.C
+			}
+		case <-eagerAckC:
+			eagerAckTimer, eagerAckC = nil, nil
+			if err := ack(); err != nil {
+				return err
 			}
 		case <-r.shutdownChan.Channel():
 			return nil
 		}
+	}
+}
+
+// signalAck wakes the ack loop for an eager acknowledgement. Never blocks.
+func (r *StreamReceiverImpl) signalAck() {
+	select {
+	case r.ackSignalChan <- struct{}{}:
+	default:
 	}
 }
 
@@ -452,6 +504,11 @@ func (r *StreamReceiverImpl) processMessages(
 			Watermark: exclusiveHighWatermark,
 			Timestamp: exclusiveHighWatermarkTime,
 		}, convertedTasks...)
+		eagerAck := r.Config.ReplicationStreamEagerSyncStatusInterval() > 0
+		if eagerAck {
+			// The high watermark may have advanced past tasks the sender skipped.
+			r.signalAck()
+		}
 		if isolatedNamespaceID := messages.GetIsolatedNamespaceId(); isolatedNamespaceID != "" {
 			// Finish strictly after TrackTasks: the ack loop may only delete a
 			// retiring lane once no batch sits between lane resolution and tracking,
@@ -478,6 +535,10 @@ func (r *StreamReceiverImpl) processMessages(
 						return hook(originalTask.ReplicationTask(), originalTask.Execute)
 					},
 				}
+			}
+
+			if eagerAck {
+				task = ackNotifyingTask{TrackableExecutableTask: task, notify: r.signalAck}
 			}
 
 			start := time.Now()

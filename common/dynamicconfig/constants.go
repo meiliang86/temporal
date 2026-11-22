@@ -3198,6 +3198,29 @@ that task will be sent to DLQ.`,
 		1*time.Second,
 		`ReplicationStreamSyncStatusDuration sync replication status duration`,
 	)
+	ReplicationStreamEagerSyncStatusInterval = NewGlobalDurationSetting(
+		"history.ReplicationStreamEagerSyncStatusInterval",
+		0,
+		`ReplicationStreamEagerSyncStatusInterval makes the replication stream receiver acknowledge progress
+shortly after replication tasks finish, instead of only every ReplicationStreamSyncStatusDuration.
+Completions within this interval are coalesced into one acknowledgement. Zero disables eager
+acknowledgement. Set it (e.g. 5ms) on standby clusters of namespaces that use sync replication.`,
+	)
+	SyncReplicationEnabled = NewNamespaceBoolSetting(
+		"history.syncReplicationEnabled",
+		false,
+		`SyncReplicationEnabled makes the active cluster of a global namespace wait, after persisting each
+workflow transaction, until every other cluster of the namespace has acknowledged applying the
+transaction's replication tasks. Until then the transaction's mutable state, history events and tasks
+are not visible to anything except the replication stream. Experimental: no failover support.`,
+	)
+	SyncReplicationCommitTimeout = NewNamespaceDurationSetting(
+		"history.syncReplicationCommitTimeout",
+		10*time.Second,
+		`SyncReplicationCommitTimeout caps how long a workflow transaction waits for sync replication
+acknowledgement, in addition to the caller's deadline. On timeout the caller gets Unavailable; the
+transaction stays persisted locally and is hidden until it is acknowledged.`,
+	)
 	ReplicationProcessorSchedulerQueueSize = NewGlobalIntSetting(
 		"history.ReplicationProcessorSchedulerQueueSize",
 		128,

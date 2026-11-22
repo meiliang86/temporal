@@ -114,6 +114,11 @@ func (c *SourceTaskConverterImpl) Convert(
 	ctx, cancel = newTaskContext(nsName, c.config.ReplicationTaskApplyTimeout(), callerInfo)
 	defer cancel()
 	ctx = withWorkflowLockPriority(ctx, workflowLockPriority)
+	if namespaceEntry != nil && c.config.SyncReplicationEnabled(nsName) {
+		// A transaction of this workflow may be waiting, with the workflow lock handed off, for the
+		// acknowledgement of the very task being converted here. Read it as a sync replication reader.
+		ctx = workflow.WithSyncReplicationReader(ctx)
+	}
 	replicationTask, err := c.historyEngine.ConvertReplicationTask(ctx, task, targetClusterID)
 	if err != nil {
 		return nil, err

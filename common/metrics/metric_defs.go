@@ -1282,6 +1282,16 @@ var (
 	// difference between task IDs so its unit should be "tasks".
 	ReplicationTasksLag                             = NewDimensionlessHistogramDef("replication_tasks_lag")
 	ReplicationDeleteExecutionTaskGenerationFailure = NewCounterDef("replication_delete_execution_task_generation_failure")
+	// SyncReplicationCommitLatency is how long a workflow transaction of a sync replication namespace
+	// waited, after persisting locally, for the remote clusters to acknowledge it.
+	SyncReplicationCommitLatency = NewTimerDef(
+		"sync_replication_commit_latency",
+		WithDescription("Time a sync replication transaction waited for remote clusters to acknowledge it."),
+	)
+	SyncReplicationCommitTimeout = NewCounterDef(
+		"sync_replication_commit_timeout",
+		WithDescription("Number of sync replication transactions whose acknowledgement wait timed out."),
+	)
 	// ReplicationTasksFetched records the number of tasks fetched by the poller.
 	ReplicationTasksFetched                        = NewDimensionlessHistogramDef("replication_tasks_fetched")
 	ReplicationLatency                             = NewTimerDef("replication_latency")

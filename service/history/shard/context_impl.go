@@ -149,7 +149,14 @@ type (
 		taskKeyManager *taskKeyManager
 
 		// exist only in memory
-		remoteClusterInfos      map[string]*remoteClusterInfo
+		remoteClusterInfos map[string]*remoteClusterInfo
+		// replicationAckNotifyCh is closed and replaced, under the write lock, whenever a remote
+		// cluster acknowledges replication progress. Used to wake WaitForReplicationCommit.
+		replicationAckNotifyCh chan struct{}
+		// syncReplicationBarrier is the largest replication task ID that a sync replication transaction
+		// of this shard may be waiting on. It starts just below this owner's first task ID range, which
+		// covers everything previous owners persisted.
+		syncReplicationBarrier  atomic.Int64
 		handoverTracker         HandoverTracker
 		acquireShardRetryPolicy backoff.RetryPolicy
 
@@ -427,6 +434,7 @@ func (s *ContextImpl) UpdateRemoteClusterInfo(
 		remoteClusterInfo.AckedReplicationTaskIDs[remoteShardID] = ackTaskID
 		remoteClusterInfo.AckedReplicationTimestamps[remoteShardID] = ackTimestamp
 	}
+	s.notifyReplicationAckLocked()
 }
 
 // UpdateRemoteReaderInfo do not use streaming replication until remoteClusterInfo is updated to allow both
@@ -449,7 +457,82 @@ func (s *ContextImpl) UpdateRemoteReaderInfo(
 	remoteClusterInfo := s.getOrUpdateRemoteClusterInfoLocked(clusterName)
 	remoteClusterInfo.AckedReplicationTaskIDs[shardID] = ackTaskID
 	remoteClusterInfo.AckedReplicationTimestamps[shardID] = ackTimestamp
+	s.notifyReplicationAckLocked()
 	return nil
+}
+
+// WaitForReplicationCommit blocks until each of the given remote clusters has acknowledged applying
+// every replication task of this shard with ID <= taskID, or until ctx is done or the shard stops.
+// When a remote cluster has a different shard count, this shard streams to several of its shards,
+// and all of them must have acknowledged.
+func (s *ContextImpl) WaitForReplicationCommit(
+	ctx context.Context,
+	clusters []string,
+	taskID int64,
+) error {
+	for {
+		s.rLock()
+		committed := s.isReplicationCommittedLocked(clusters, taskID)
+		notifyCh := s.replicationAckNotifyCh
+		s.rUnlock()
+		if committed {
+			return nil
+		}
+		select {
+		case <-notifyCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.lifecycleCtx.Done():
+			return s.lifecycleCtx.Err()
+		}
+	}
+}
+
+// RecordSyncReplicationBarrier records that a persisted transaction waits for sync replication to
+// acknowledge every replication task with ID <= taskID.
+func (s *ContextImpl) RecordSyncReplicationBarrier(taskID int64) {
+	for {
+		current := s.syncReplicationBarrier.Load()
+		if taskID <= current || s.syncReplicationBarrier.CompareAndSwap(current, taskID) {
+			return
+		}
+	}
+}
+
+// SyncReplicationBarrier returns a replication task ID covering every transaction of this shard that
+// sync replication may not have acknowledged yet. Every such replication task has been handed to the
+// replication stream, so waiting on it cannot stall on an idle stream.
+func (s *ContextImpl) SyncReplicationBarrier() int64 {
+	return s.syncReplicationBarrier.Load()
+}
+
+func (s *ContextImpl) isReplicationCommittedLocked(clusters []string, taskID int64) bool {
+	allClusterInfo := s.clusterMetadata.GetAllClusterInfo()
+	localShardCount := allClusterInfo[s.clusterMetadata.GetCurrentClusterName()].ShardCount
+	for _, clusterName := range clusters {
+		info, ok := s.remoteClusterInfos[clusterName]
+		if !ok {
+			return false
+		}
+		remoteCluster, ok := allClusterInfo[clusterName]
+		if !ok {
+			return false
+		}
+		for _, remoteShardID := range common.MapShardID(localShardCount, remoteCluster.ShardCount, s.shardID) {
+			acked, ok := info.AckedReplicationTaskIDs[remoteShardID]
+			if !ok || acked < taskID {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *ContextImpl) notifyReplicationAckLocked() {
+	if s.replicationAckNotifyCh != nil {
+		close(s.replicationAckNotifyCh)
+	}
+	s.replicationAckNotifyCh = make(chan struct{})
 }
 
 func (s *ContextImpl) GetReplicatorDLQAckLevel(sourceCluster string) int64 {
@@ -1311,6 +1394,11 @@ func (s *ContextImpl) renewRangeLocked(isStealing bool) error {
 
 	s.shardInfo = trimShardInfo(s.config, s.clusterMetadata.GetAllClusterInfo(), s.copyShardInfo(updatedShardInfo))
 	s.taskKeyManager.setRangeID(s.shardInfo.RangeId)
+	if s.syncReplicationBarrier.Load() == 0 {
+		// Every task a previous owner persisted has an ID below this owner's first range, and the
+		// replication stream's catch-up sends at least up to it.
+		s.syncReplicationBarrier.Store(s.taskKeyManager.peekTaskKey(tasks.CategoryReplication).TaskID - 1)
+	}
 
 	return nil
 }
@@ -2310,6 +2398,7 @@ func newContext(
 		shardID:                 shardID,
 		owner:                   fmt.Sprintf("%s-%v-%v", hostIdentity, sequenceID, uuid.NewString()),
 		stringRepr:              fmt.Sprintf("Shard(%d)", shardID),
+		replicationAckNotifyCh:  make(chan struct{}),
 		executionManager:        persistenceExecutionManager,
 		metricsHandler:          metricsHandler,
 		eventLogger:             eventLogger,

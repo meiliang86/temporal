@@ -81,6 +81,15 @@ type (
 
 		UpdateRemoteClusterInfo(cluster string, ackTaskID int64, ackTimestamp time.Time)
 		UpdateRemoteReaderInfo(readerID int64, ackTaskID int64, ackTimestamp time.Time) error
+		// WaitForReplicationCommit blocks until each of the given remote clusters has acknowledged
+		// applying every replication task of this shard with ID <= taskID, or ctx is done.
+		WaitForReplicationCommit(ctx context.Context, clusters []string, taskID int64) error
+		// RecordSyncReplicationBarrier records that a persisted transaction waits for sync replication
+		// to acknowledge every replication task with ID <= taskID.
+		RecordSyncReplicationBarrier(taskID int64)
+		// SyncReplicationBarrier returns a replication task ID covering every transaction of this shard
+		// that sync replication may not have acknowledged yet.
+		SyncReplicationBarrier() int64
 
 		SetCurrentTime(cluster string, currentTime time.Time)
 		GetCurrentTime(cluster string) time.Time

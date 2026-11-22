@@ -339,6 +339,9 @@ type Config struct {
 	ReplicationExecutableTaskErrorRetryExpiration         dynamicconfig.DurationPropertyFn
 
 	ReplicationStreamSyncStatusDuration                 dynamicconfig.DurationPropertyFn
+	ReplicationStreamEagerSyncStatusInterval            dynamicconfig.DurationPropertyFn
+	SyncReplicationEnabled                              dynamicconfig.BoolPropertyFnWithNamespaceFilter
+	SyncReplicationCommitTimeout                        dynamicconfig.DurationPropertyFnWithNamespaceFilter
 	ReplicationProcessorSchedulerQueueSize              dynamicconfig.IntPropertyFn
 	ReplicationProcessorSchedulerWorkerCount            dynamicconfig.TypedSubscribable[int]
 	ReplicationLowPriorityProcessorSchedulerWorkerCount dynamicconfig.TypedSubscribable[int]
@@ -693,6 +696,9 @@ func NewConfig(
 		ReplicationEnableUpdateWithNewTaskMerge:             dynamicconfig.ReplicationEnableUpdateWithNewTaskMerge.Get(dc),
 		ValidateReplicationTaskSourceCluster:                dynamicconfig.ValidateReplicationTaskSourceCluster.Get(dc),
 		ReplicationStreamSyncStatusDuration:                 dynamicconfig.ReplicationStreamSyncStatusDuration.Get(dc),
+		ReplicationStreamEagerSyncStatusInterval:            dynamicconfig.ReplicationStreamEagerSyncStatusInterval.Get(dc),
+		SyncReplicationEnabled:                              dynamicconfig.SyncReplicationEnabled.Get(dc),
+		SyncReplicationCommitTimeout:                        dynamicconfig.SyncReplicationCommitTimeout.Get(dc),
 		ReplicationProcessorSchedulerQueueSize:              dynamicconfig.ReplicationProcessorSchedulerQueueSize.Get(dc),
 		ReplicationProcessorSchedulerWorkerCount:            dynamicconfig.ReplicationProcessorSchedulerWorkerCount.Subscribe(dc),
 		ReplicationLowPriorityProcessorSchedulerWorkerCount: dynamicconfig.ReplicationLowPriorityProcessorSchedulerWorkerCount.Subscribe(dc),

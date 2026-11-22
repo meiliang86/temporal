@@ -459,6 +459,16 @@ func (s *Starter) handleConflict(
 	creationParams *creationParams,
 	currentWorkflowConditionFailed *persistence.CurrentWorkflowConditionFailedError,
 ) (*historyservice.StartWorkflowExecutionResponse, StartOutcome, error) {
+	// Under sync replication the current run may come from a transaction that the remote clusters
+	// haven't acknowledged yet (e.g. this is a retry after the original request timed out waiting).
+	// Loading its mutable state goes through the acknowledgement gate, so nothing below answers from
+	// unacknowledged state.
+	if currentWorkflowConditionFailed.RunID != "" &&
+		len(workflow.SyncReplicationClusters(s.shardContext, s.namespace, s.request.StartRequest.GetWorkflowId())) > 0 {
+		if _, err := s.getMutableStateInfo(ctx, currentWorkflowConditionFailed.RunID); err != nil {
+			return nil, StartErr, err
+		}
+	}
 	// CurrentWorkflowConditionFailedError is built from the persisted WorkflowExecutionState blob,
 	// which may not yet carry first_execution_run_id on workflows persisted before that field
 	// existed. In that case, load mutable state once to recover the canonical head-of-chain run id

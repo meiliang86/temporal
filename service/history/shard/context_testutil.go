@@ -171,10 +171,11 @@ func newTestContext(t *resourcetest.Test, eventsCache events.Cache, config Conte
 		queueMetricEmitter:  sync.Once{},
 		eventLogger:         config.EventLogger,
 
-		state:              contextStateAcquired,
-		engineFuture:       future.NewFuture[historyi.Engine](),
-		shardInfo:          config.ShardInfo,
-		remoteClusterInfos: make(map[string]*remoteClusterInfo),
+		state:                  contextStateAcquired,
+		engineFuture:           future.NewFuture[historyi.Engine](),
+		shardInfo:              config.ShardInfo,
+		remoteClusterInfos:     make(map[string]*remoteClusterInfo),
+		replicationAckNotifyCh: make(chan struct{}),
 
 		clusterMetadata:      clusterMetadata,
 		timeSource:           t.TimeSource,

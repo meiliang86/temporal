@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/trace"
 	commandpb "go.temporal.io/api/command/v1"
@@ -61,6 +62,15 @@ type (
 		paginationLimiter *limiter.KeyedBytesLimiter
 
 		checkRunAlreadyExists bool
+
+		// locked is true while the lock semaphore is held by someone. Used to decide whether a sync
+		// replication wait can hand the lock off (transient contexts are never locked).
+		locked atomic.Bool
+		// syncReplicationHold is non-nil while a transaction of this context waits for sync
+		// replication acknowledgement with the lock handed off. Only sync replication readers may use
+		// the context then; everyone else waits for the channel to close. Read and written only while
+		// holding the lock semaphore.
+		syncReplicationHold chan struct{}
 	}
 
 	// workflowTaskIdentity identifies a specific workflow task attempt
@@ -161,15 +171,62 @@ func (c *ContextImpl) Lock(
 	ctx context.Context,
 	lockPriority locks.Priority,
 ) error {
-	return c.lock.Acquire(ctx, lockPriority, 1)
+	for {
+		if err := c.lock.Acquire(ctx, lockPriority, 1); err != nil {
+			return err
+		}
+		hold := c.syncReplicationHold
+		if hold == nil || isSyncReplicationReader(ctx) {
+			c.locked.Store(true)
+			return nil
+		}
+		// A transaction is waiting for sync replication acknowledgement and has handed the lock off to
+		// replication readers only. Wait until the writer is done with it.
+		c.lock.Release(1)
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (c *ContextImpl) TryLock(lockPriority locks.Priority) bool {
-	return c.lock.TryAcquire(lockPriority, 1)
+	if !c.lock.TryAcquire(lockPriority, 1) {
+		return false
+	}
+	if c.syncReplicationHold != nil {
+		c.lock.Release(1)
+		return false
+	}
+	c.locked.Store(true)
+	return true
 }
 
 func (c *ContextImpl) Unlock() {
+	c.locked.Store(false)
 	c.lock.Release(1)
+}
+
+// beginSyncReplicationWait hands the workflow lock to sync replication readers while the caller, who
+// holds the lock, waits for its transaction to be acknowledged. The returned function takes the lock
+// back. If the lock isn't held (a transient context), nothing is handed off.
+func (c *ContextImpl) beginSyncReplicationWait() func() {
+	if !c.locked.Load() {
+		return func() {}
+	}
+	hold := make(chan struct{})
+	c.syncReplicationHold = hold
+	c.locked.Store(false)
+	c.lock.Release(1)
+	return func() {
+		// Only replication readers can hold the lock now, and only briefly; everyone else backs off
+		// until hold is closed. Never give up here: the caller still owns the lock.
+		_ = c.lock.Acquire(context.Background(), locks.PriorityHigh, 1)
+		c.locked.Store(true)
+		c.syncReplicationHold = nil
+		close(hold)
+	}
 }
 
 func (c *ContextImpl) IsDirty() bool {
@@ -180,6 +237,11 @@ func (c *ContextImpl) IsDirty() bool {
 }
 
 func (c *ContextImpl) Clear() {
+	if c.syncReplicationHold != nil {
+		// A replication reader released the context with an error while the writer that handed it the
+		// lock is still waiting. The writer owns the mutable state; leave it alone.
+		return
+	}
 	metrics.WorkflowContextCleared.With(c.metricsHandler).Record(1)
 	if c.MutableState != nil {
 		c.MutableState.GetQueryRegistry().Clear()
@@ -449,12 +511,74 @@ func (c *ContextImpl) LoadExecutionStats(ctx context.Context, shardContext histo
 	return c.MutableState.GetExecutionInfo().ExecutionStats, nil
 }
 
+// loadMutableStateForSyncReplicationReader returns the mutable state for the replication stream
+// sender. It never starts a transaction (the sender only reads) and never caches state it loads from
+// the database: that state may hold a transaction sync replication hasn't acknowledged, and the next
+// regular caller must load it through the gate in LoadMutableState.
+func (c *ContextImpl) loadMutableStateForSyncReplicationReader(
+	ctx context.Context,
+	shardContext historyi.ShardContext,
+	namespaceEntry *namespace.Namespace,
+) (historyi.MutableState, error) {
+	if c.MutableState != nil {
+		return c.MutableState, nil
+	}
+	response, err := getWorkflowExecution(ctx, shardContext, &persistence.GetWorkflowExecutionRequest{
+		ShardID:     shardContext.GetShardID(),
+		NamespaceID: c.workflowKey.NamespaceID,
+		WorkflowID:  c.workflowKey.WorkflowID,
+		RunID:       c.workflowKey.RunID,
+		ArchetypeID: c.archetypeID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	mutableState, err := NewMutableStateFromDB(
+		shardContext,
+		shardContext.GetEventsCache(),
+		c.logger,
+		namespaceEntry,
+		response.State,
+		response.DBRecordVersion,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if c.archetypeID != chasm.UnspecifiedArchetypeID && c.archetypeID != mutableState.ChasmTree().ArchetypeID() {
+		return nil, serviceerror.NewNotFoundf("CHASM Archetype missmatch for %v", c.workflowKey)
+	}
+	return mutableState, nil
+}
+
+// waitForLoadedStateSyncReplication waits, after mutable state was loaded from the database, until
+// sync replication has acknowledged every sync transaction this shard has persisted so far. That covers
+// the last transaction of this workflow without knowing its replication task ID.
+func (c *ContextImpl) waitForLoadedStateSyncReplication(
+	ctx context.Context,
+	shardContext historyi.ShardContext,
+	namespaceEntry *namespace.Namespace,
+) error {
+	clusters := SyncReplicationClusters(shardContext, namespaceEntry, c.workflowKey.WorkflowID)
+	if len(clusters) == 0 {
+		return nil
+	}
+	barrier := shardContext.SyncReplicationBarrier()
+	if barrier <= 0 {
+		return nil
+	}
+	return waitForSyncReplicationCommit(ctx, shardContext, namespaceEntry, clusters, barrier, c)
+}
+
 func (c *ContextImpl) LoadMutableState(ctx context.Context, shardContext historyi.ShardContext) (historyi.MutableState, error) {
 	namespaceEntry, err := shardContext.GetNamespaceRegistry().GetNamespaceByID(
 		namespace.ID(c.workflowKey.NamespaceID),
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if isSyncReplicationReader(ctx) {
+		return c.loadMutableStateForSyncReplicationReader(ctx, shardContext, namespaceEntry)
 	}
 
 	if c.MutableState != nil {
@@ -496,6 +620,12 @@ func (c *ContextImpl) LoadMutableState(ctx context.Context, shardContext history
 		// returned by NewMutableStateFromDB().
 		// Thus causing NPE (e.g. when calling c.Clear()) or other unexpected behavior.
 		c.MutableState = mutableState
+
+		// The persisted state may include a transaction that sync replication hasn't acknowledged yet.
+		if err := c.waitForLoadedStateSyncReplication(ctx, shardContext, namespaceEntry); err != nil {
+			c.Clear()
+			return nil, err
+		}
 	}
 
 	mutableStateArchetypeID := c.MutableState.ChasmTree().ArchetypeID()
@@ -617,7 +747,7 @@ func (c *ContextImpl) CreateWorkflowExecution(
 	}
 
 	_, err := createWorkflowExecution(
-		ctx,
+		withSyncReplicationLockHandoff(ctx, c),
 		shardContext,
 		newMutableState.GetCurrentVersion(),
 		createRequest,
@@ -731,7 +861,7 @@ func (c *ContextImpl) ConflictResolveWorkflowExecution(
 	}
 
 	if _, _, _, err := NewTransaction(shardContext).ConflictResolveWorkflowExecution(
-		ctx,
+		withSyncReplicationLockHandoff(ctx, c),
 		conflictResolveMode,
 		c.archetypeID,
 		resetMutableState.GetCurrentVersion(),
@@ -1109,7 +1239,7 @@ func (c *ContextImpl) executeWorkflowTransaction(
 	}
 
 	if _, _, err := NewTransaction(shardContext).UpdateWorkflowExecution(
-		ctx,
+		withSyncReplicationLockHandoff(ctx, c),
 		updateMode,
 		c.archetypeID,
 		c.MutableState.GetCurrentVersion(),
@@ -1178,7 +1308,7 @@ func (c *ContextImpl) SubmitClosedWorkflowSnapshot(
 	}
 
 	return NewTransaction(shardContext).SetWorkflowExecution(
-		ctx,
+		withSyncReplicationLockHandoff(ctx, c),
 		c.archetypeID,
 		resetWorkflowSnapshot,
 	)

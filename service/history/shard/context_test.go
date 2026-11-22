@@ -766,6 +766,78 @@ func (s *contextSuite) TestUpdateGetRemoteReaderInfo_8_4() {
 	}, remoteAckStatus)
 }
 
+func (s *contextSuite) TestWaitForReplicationCommit() {
+	clusterMetadata := cluster.NewMockMetadata(s.controller)
+	clusterMetadata.EXPECT().GetClusterID().Return(cluster.TestCurrentClusterInitialFailoverVersion).AnyTimes()
+	clusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	clusterMetadata.EXPECT().GetAllClusterInfo().Return(map[string]cluster.ClusterInformation{
+		cluster.TestCurrentClusterName: {
+			Enabled:                true,
+			InitialFailoverVersion: cluster.TestCurrentClusterInitialFailoverVersion,
+			RPCAddress:             cluster.TestCurrentClusterFrontendAddress,
+			ShardCount:             4,
+		},
+		cluster.TestAlternativeClusterName: {
+			Enabled:                true,
+			InitialFailoverVersion: cluster.TestAlternativeClusterInitialFailoverVersion,
+			RPCAddress:             cluster.TestAlternativeClusterFrontendAddress,
+			ShardCount:             8,
+		},
+	}).AnyTimes()
+	s.mockShard.clusterMetadata = clusterMetadata
+
+	clusters := []string{cluster.TestAlternativeClusterName}
+	readerID := func(remoteShardID int32) int64 {
+		return ReplicationReaderIDFromClusterShardID(cluster.TestAlternativeClusterInitialFailoverVersion, remoteShardID)
+	}
+	notDone := func(done <-chan error) {
+		select {
+		case err := <-done:
+			s.Failf("WaitForReplicationCommit returned before commit", "err: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	// Nothing acknowledged yet.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	s.ErrorIs(s.mockShard.WaitForReplicationCommit(ctx, clusters, 100), context.DeadlineExceeded)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.mockShard.WaitForReplicationCommit(context.Background(), clusters, 100)
+	}()
+
+	// Local shard 1 streams to remote shards 1 and 5: both must acknowledge.
+	s.NoError(s.mockShard.UpdateRemoteReaderInfo(readerID(1), 100, time.Now()))
+	notDone(done)
+	s.NoError(s.mockShard.UpdateRemoteReaderInfo(readerID(5), 99, time.Now()))
+	notDone(done)
+	s.NoError(s.mockShard.UpdateRemoteReaderInfo(readerID(5), 150, time.Now()))
+	select {
+	case err := <-done:
+		s.NoError(err)
+	case <-time.After(5 * time.Second):
+		s.Fail("WaitForReplicationCommit was not woken by the acknowledgement")
+	}
+
+	// Already acknowledged.
+	s.NoError(s.mockShard.WaitForReplicationCommit(context.Background(), clusters, 100))
+	// A cluster that never acknowledged anything blocks the commit.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel2()
+	s.Error(s.mockShard.WaitForReplicationCommit(ctx2, []string{cluster.TestAlternativeClusterName, "unknown-cluster"}, 100))
+}
+
+func (s *contextSuite) TestSyncReplicationBarrier() {
+	s.Equal(int64(0), s.mockShard.SyncReplicationBarrier())
+	s.mockShard.RecordSyncReplicationBarrier(10)
+	s.mockShard.RecordSyncReplicationBarrier(7)
+	s.Equal(int64(10), s.mockShard.SyncReplicationBarrier())
+	s.mockShard.RecordSyncReplicationBarrier(12)
+	s.Equal(int64(12), s.mockShard.SyncReplicationBarrier())
+}
+
 func (s *contextSuite) TestUpdateGetRemoteReaderInfo_4_8() {
 	clusterMetadata := cluster.NewMockMetadata(s.controller)
 	clusterMetadata.EXPECT().GetClusterID().Return(cluster.TestCurrentClusterInitialFailoverVersion).AnyTimes()
