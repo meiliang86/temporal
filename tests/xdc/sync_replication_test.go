@@ -2,6 +2,7 @@ package xdc
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -22,29 +23,33 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// syncReplicationTestSuite covers history.syncReplicationEnabled: the active cluster acknowledges a
-// workflow transaction only after the standby has applied it, and hides it until then.
+// syncReplicationTestSuite covers history.syncReplicationEnabled: the active cluster (clusters[0])
+// acknowledges a workflow transaction only after every other cluster of the namespace has applied it,
+// and hides it until then.
 type syncReplicationTestSuite struct {
 	xdcBaseSuite
 }
 
 func TestSyncReplicationTestSuite(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct {
-		name                    string
-		enableTransitionHistory bool
-	}{
-		// Event-based replication: tasks are usually built from cached event blobs.
-		{name: "DisableTransitionHistory", enableTransitionHistory: false},
-		// State-based replication: every task is built from the mutable state, under the workflow
-		// lock that the waiting writer hands off.
-		{name: "EnableTransitionHistory", enableTransitionHistory: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &syncReplicationTestSuite{}
-			s.enableTransitionHistory = tc.enableTransitionHistory
-			suite.Run(t, s)
-		})
+	for _, clusterCount := range []int{2, 3} {
+		for _, tc := range []struct {
+			name                    string
+			enableTransitionHistory bool
+		}{
+			// Event-based replication: tasks are usually built from cached event blobs.
+			{name: "DisableTransitionHistory", enableTransitionHistory: false},
+			// State-based replication: every task is built from the mutable state, under the workflow
+			// lock that the waiting writer hands off.
+			{name: "EnableTransitionHistory", enableTransitionHistory: true},
+		} {
+			t.Run(fmt.Sprintf("%dClusters/%s", clusterCount, tc.name), func(t *testing.T) {
+				s := &syncReplicationTestSuite{}
+				s.enableTransitionHistory = tc.enableTransitionHistory
+				s.clusterNames = []string{"active", "standby1", "standby2"}[:clusterCount]
+				suite.Run(t, s)
+			})
+		}
 	}
 }
 
@@ -66,7 +71,7 @@ func (s *syncReplicationTestSuite) SetupTest() {
 	s.setupTest()
 }
 
-// Every acknowledged write must already be in the standby's database: no polling.
+// Every acknowledged write must already be in every standby's database: no polling.
 func (s *syncReplicationTestSuite) TestAcknowledgedWritesAreOnStandby() {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -78,7 +83,7 @@ func (s *syncReplicationTestSuite) TestAcknowledgedWritesAreOnStandby() {
 
 	startResp, err := active.FrontendClient().StartWorkflowExecution(ctx, s.startRequest(ns, workflowID, taskQueue, uuid.NewString()))
 	s.Require().NoError(err)
-	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, s.standbyStatus(ctx, ns, workflowID, startResp.GetRunId()))
+	s.requireStatusOnStandbys(ctx, s.clusters[1:], ns, workflowID, startResp.GetRunId(), enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING)
 
 	//nolint:staticcheck // TODO: replace with taskpoller.TaskPoller
 	poller := &testcore.TaskPoller{
@@ -101,11 +106,12 @@ func (s *syncReplicationTestSuite) TestAcknowledgedWritesAreOnStandby() {
 	}
 	_, err = poller.PollAndProcessWorkflowTask()
 	s.Require().NoError(err)
-	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED, s.standbyStatus(ctx, ns, workflowID, startResp.GetRunId()))
+	s.requireStatusOnStandbys(ctx, s.clusters[1:], ns, workflowID, startResp.GetRunId(), enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED)
 }
 
-// While the standby doesn't apply replication, a write blocks and times out, stays invisible on the
-// active, and a retry returns the original result once the standby catches up.
+// While one standby doesn't apply replication, a write blocks and times out (even if the other
+// standbys acknowledge it), stays invisible on the active, and a retry returns the original result
+// once that standby catches up.
 func (s *syncReplicationTestSuite) TestUnacknowledgedWriteIsHidden() {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -113,7 +119,7 @@ func (s *syncReplicationTestSuite) TestUnacknowledgedWriteIsHidden() {
 	ns := s.createNamespace(true, s.clusters)
 	namespaceID := s.describeNamespace(s.T(), s.clusters[0], ns, true).GetNamespaceInfo().GetId()
 	active := s.clusters[0]
-	standby := s.clusters[1]
+	standby := s.clusters[len(s.clusters)-1] // the paused one; any others keep applying
 
 	release := make(chan struct{})
 	released := false
@@ -157,7 +163,7 @@ func (s *syncReplicationTestSuite) TestUnacknowledgedWriteIsHidden() {
 	// A retry with the same request ID returns the original run once the standby has applied it.
 	startResp, err := active.FrontendClient().StartWorkflowExecution(ctx, request)
 	s.Require().NoError(err)
-	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, s.standbyStatus(ctx, ns, workflowID, startResp.GetRunId()))
+	s.requireStatusOnStandbys(ctx, s.clusters[1:], ns, workflowID, startResp.GetRunId(), enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING)
 
 	describeResp, err := active.FrontendClient().DescribeWorkflowExecution(ctx, &workflowservice.DescribeWorkflowExecutionRequest{
 		Namespace: ns,
@@ -165,6 +171,36 @@ func (s *syncReplicationTestSuite) TestUnacknowledgedWriteIsHidden() {
 	})
 	s.Require().NoError(err)
 	s.Equal(startResp.GetRunId(), describeResp.GetWorkflowExecutionInfo().GetExecution().GetRunId())
+}
+
+// Only the namespace's own clusters must acknowledge: a cluster the namespace isn't replicated to
+// doesn't block it, even while that cluster applies nothing at all.
+func (s *syncReplicationTestSuite) TestOnlyNamespaceClustersMustAcknowledge() {
+	if len(s.clusters) < 3 {
+		s.T().Skip("needs a cluster outside the namespace")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	ns := s.createNamespace(true, s.clusters[:2])
+	active := s.clusters[0]
+	outsider := s.clusters[2]
+
+	release := make(chan struct{})
+	defer close(release)
+	s.T().Cleanup(outsider.InjectHook(
+		s.T(),
+		testhooks.NewHook(testhooks.HistoryReplicationTaskInterceptor, func(_ *replicationspb.ReplicationTask, execute func() error) error {
+			<-release
+			return execute()
+		}),
+		testhooks.GlobalScope,
+	))
+
+	workflowID := "sync-repl-subset-" + uuid.NewString()
+	startResp, err := active.FrontendClient().StartWorkflowExecution(ctx, s.startRequest(ns, workflowID, "sync-repl-tq-"+uuid.NewString(), uuid.NewString()))
+	s.Require().NoError(err)
+	s.requireStatusOnStandbys(ctx, s.clusters[1:2], ns, workflowID, startResp.GetRunId(), enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING)
 }
 
 func (s *syncReplicationTestSuite) startRequest(ns, workflowID, taskQueue, requestID string) *workflowservice.StartWorkflowExecutionRequest {
@@ -179,9 +215,22 @@ func (s *syncReplicationTestSuite) startRequest(ns, workflowID, taskQueue, reque
 	}
 }
 
-// standbyStatus reads the workflow straight from the standby cluster's database.
-func (s *syncReplicationTestSuite) standbyStatus(ctx context.Context, ns, workflowID, runID string) enumspb.WorkflowExecutionStatus {
-	resp, err := s.clusters[1].AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+// requireStatusOnStandbys checks the workflow straight in each standby cluster's database, once, with
+// no polling: an acknowledged write must already be there.
+func (s *syncReplicationTestSuite) requireStatusOnStandbys(
+	ctx context.Context,
+	standbys []*testcore.TestCluster,
+	ns, workflowID, runID string,
+	expected enumspb.WorkflowExecutionStatus,
+) {
+	for _, standby := range standbys {
+		s.Equal(expected, s.standbyStatus(ctx, standby, ns, workflowID, runID), "cluster %s", standby.ClusterName())
+	}
+}
+
+// standbyStatus reads the workflow straight from a standby cluster's database.
+func (s *syncReplicationTestSuite) standbyStatus(ctx context.Context, standby *testcore.TestCluster, ns, workflowID, runID string) enumspb.WorkflowExecutionStatus {
+	resp, err := standby.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
 		Namespace: ns,
 		Execution: &commonpb.WorkflowExecution{WorkflowId: workflowID, RunId: runID},
 	})
