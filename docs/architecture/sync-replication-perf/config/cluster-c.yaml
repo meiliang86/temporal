@@ -1,0 +1,85 @@
+log:
+  stdout: true
+  level: warn
+
+persistence:
+  defaultStore: default
+  visibilityStore: visibility
+  numHistoryShards: 8
+  datastores:
+    default:
+      sql:
+        pluginName: "postgres12"
+        databaseName: "temporal_c"
+        connectAddr: "127.0.0.1:5432"
+        connectProtocol: "tcp"
+        user: "postgres"
+        password: ""
+        maxConns: 100
+        maxIdleConns: 100
+        maxConnLifetime: "1h"
+    visibility:
+      sql:
+        pluginName: "postgres12"
+        databaseName: "temporal_c_vis"
+        connectAddr: "127.0.0.1:5432"
+        connectProtocol: "tcp"
+        user: "postgres"
+        password: ""
+        maxConns: 20
+        maxIdleConns: 20
+        maxConnLifetime: "1h"
+
+global:
+  membership:
+    maxJoinDuration: 30s
+    broadcastAddress: "127.0.0.1"
+  pprof:
+    port: 9936
+  metrics:
+    prometheus:
+      framework: "tally"
+      timerType: "histogram"
+      listenAddress: "127.0.0.1:8002"
+
+services:
+  frontend:
+    rpc:
+      grpcPort: 9233
+      membershipPort: 9933
+      bindOnLocalHost: true
+      httpPort: 9243
+  matching:
+    rpc:
+      grpcPort: 9235
+      membershipPort: 9935
+      bindOnLocalHost: true
+  history:
+    rpc:
+      grpcPort: 9234
+      membershipPort: 9934
+      bindOnLocalHost: true
+  worker:
+    rpc:
+      grpcPort: 9239
+      membershipPort: 9939
+      bindOnLocalHost: true
+
+clusterMetadata:
+  enableGlobalNamespace: true
+  failoverVersionIncrement: 100
+  masterClusterName: "cluster-c"
+  currentClusterName: "cluster-c"
+  clusterInformation:
+    cluster-c:
+      enabled: true
+      initialFailoverVersion: 3
+      rpcName: "frontend"
+      rpcAddress: "localhost:9233"
+
+dcRedirectionPolicy:
+  policy: "noop"
+
+dynamicConfigClient:
+  filepath: "/home/user/perf/config/dynamic-c.yaml"
+  pollInterval: "5s"

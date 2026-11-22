@@ -1,6 +1,6 @@
 # Sync replication: performance test results
 
-Prototype: branch `sync-replication/v1-blocking` (commit `b33e181`). Date: 2026-11-22.
+Prototype: branch `sync-replication/v1-blocking` (commit `b33e181`; three-cluster runs on `35af3ba`, same server code). Date: 2026-11-22.
 
 ## Setup
 
@@ -67,10 +67,29 @@ All four namespaces run at the same time with a 40 ms RTT. The baseline is the s
 - **Commit wait grows to 174 ms:** that's 3× test 1 under similar load. The sync namespace's replication tasks share the per-shard replication lane with three times as much async traffic, so its commits wait behind that backlog (head-of-line blocking, as the design predicted).
 - ⚠ **The tail is lost workflow tasks plus a stream reconnect** (findings 2 and 3). It is not a steady-state effect.
 
+## Test 3: three clusters
+
+- **Clusters:** `cluster-a` (active), `cluster-b` and `cluster-c`. cluster-c has **8 history shards** against 4 on the others, so each active shard streams to two cluster-c shards, and the commit must wait for both.
+- **Namespaces:** `t3` is replicated to all three. `t2c` is replicated to a and b only and serves as the two-cluster comparison inside the same environment.
+- **Network:** every pair of clusters is connected through delay proxies (`start3.sh`, `test3.sh`).
+- **Load:** fixed at 10 workflows/s, 40 ms RTT to both standbys unless noted.
+
+| Run | E2E p50 | E2E p99 | Commit wait (avg) | Notes |
+|---|---|---|---|---|
+| t3 async (trials 2, 3) | 44 / 41 ms | 251 / 109 ms | — | Trial 1 discarded as warm-up: async p50 was 4.2 s right after cluster-c started. |
+| **t3 sync** (trials 2, 3) | **346 / 340 ms** | 3.2 / 1.4 s ⚠ | 72 / 55 ms | Each commit waits for the slower of two standbys. |
+| t2c sync (a, b only, same environment) | 308 ms | 369 ms | 46 ms | Same as the two-cluster setup. cluster-c doesn't slow a namespace it isn't part of. |
+| t3 sync, **uneven standbys** (b 40 ms RTT, c 80 ms RTT) | 529 ms | 701 ms | **88 ms** | The commit is set by the slowest standby: 80 ms + ~8 ms. |
+| t3 closed loop, 16 in flight: async vs sync | 387 vs 556 ms | 981 vs 1175 ms | — / 80 ms | 29.7 vs 21.9 wf/s (−26%; −22% with two clusters). |
+
+- **Consistency check:** all 8,471 `t3` workflows from these runs are present and completed in all three clusters' databases (visibility and executions rows match).
+- **No 10 s commit timeouts.** The few counted "timeouts" (0–4 per run) are callers that gave up during reconnect stalls. Their context was cancelled, mostly `RecordWorkflowTaskStarted`, which then cost a 10 s workflow task timeout.
+- ⚠ **Reconnect stalls are more frequent and longer.** A sync commit now waits through a stream reconnect on either standby's connection. These happen about every 5 minutes per connection, so the namespace sees one about every 2.5 minutes. With cluster-c's 8 streams per active cluster, a stall lasts about 2–3.5 s, against about 1.5 s with two clusters.
+
 ## Findings
 
 1. **Deadlock found and fixed (`b33e181`).** Under load, the standby sometimes pulls state from the active to apply a task (`SyncWorkflowState`, `GetWorkflowExecutionRawHistory[V2]`). Those RPCs took the workflow lock as regular callers, so they waited behind a writer that was itself waiting for the standby, which caused 10 s stalls. Before the fix, sync closed-loop throughput at a 40 ms RTT was 18.2 wf/s with 249 timeouts; after it, 28.9 wf/s with 0 timeouts. All numbers above are from the fixed build.
-2. **Every replication stream reconnect stalls all sync commits, here for about 1.5 s.** The frontend sends a GOAWAY every 5 minutes (`frontend.keepAliveMaxConnectionAge`), so cross-cluster connections, and the streams on them, are recycled regularly. Async mode doesn't notice. Sync mode turns each reconnect into a p99 spike. Mitigation: open the new stream before closing the old one, or exempt replication connections from max-connection-age.
+2. **Every replication stream reconnect stalls all sync commits, here for about 1.5 s (2–3.5 s with three clusters, where a commit waits on either standby's reconnects).** The frontend sends a GOAWAY every 5 minutes (`frontend.keepAliveMaxConnectionAge`), so cross-cluster connections, and the streams on them, are recycled regularly. Async mode doesn't notice. Sync mode turns each reconnect into a p99 spike. Mitigation: open the new stream before closing the old one, or exempt replication connections from max-connection-age.
 3. **Losing the poller loses the workflow task.** When the worker cancels a poll while `RecordWorkflowTaskStarted` waits for its commit, the workflow task is started on the server but never delivered, so the workflow stalls for the workflow task timeout (10 s). This can happen today too, but a ~50 ms wait instead of a ~5 ms write makes the window 10× wider. Mitigations: don't hold the poll response for the commit (the "durable-ack" relaxation), or have matching detect and re-dispatch the task.
 4. **Sync namespaces need their own replication lane.** Under contention, sharing a lane with async traffic multiplies commit wait (finding from the closed-loop mixed run).
 5. **Ack coalescing:** the 5 ms eager-ack interval is a visible share of commit latency when the RTT is low. Try 1 ms or event-driven acks.
