@@ -237,3 +237,11 @@ func TestSyncReplicationLockHandoff(t *testing.T) {
 		require.ErrorIs(t, wfContext.Lock(ctx, locks.PriorityHigh), context.DeadlineExceeded)
 	})
 }
+
+func TestWithSyncReplicationReaderIfEnabled(t *testing.T) {
+	enabled := newSyncReplicationTestShard(t, true)
+	require.True(t, isSyncReplicationReader(WithSyncReplicationReaderIfEnabled(context.Background(), enabled, tests.NamespaceID)))
+
+	disabled := newSyncReplicationTestShard(t, false)
+	require.False(t, isSyncReplicationReader(WithSyncReplicationReaderIfEnabled(context.Background(), disabled, tests.NamespaceID)))
+}

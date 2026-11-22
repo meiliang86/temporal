@@ -47,6 +47,21 @@ func WithSyncReplicationReader(ctx context.Context) context.Context {
 	return context.WithValue(ctx, syncReplicationReaderKey{}, true)
 }
 
+// WithSyncReplicationReaderIfEnabled marks ctx as a sync replication reader if the namespace uses sync
+// replication. For RPCs that serve replication to another cluster (resend, backfill): the other cluster
+// may need them to apply, and acknowledge, the very transaction a writer of this workflow waits on.
+func WithSyncReplicationReaderIfEnabled(
+	ctx context.Context,
+	shardContext historyi.ShardContext,
+	namespaceID namespace.ID,
+) context.Context {
+	namespaceEntry, err := shardContext.GetNamespaceRegistry().GetNamespaceByID(namespaceID)
+	if err != nil || !shardContext.GetConfig().SyncReplicationEnabled(namespaceEntry.Name().String()) {
+		return ctx
+	}
+	return WithSyncReplicationReader(ctx)
+}
+
 func isSyncReplicationReader(ctx context.Context) bool {
 	v, ok := ctx.Value(syncReplicationReaderKey{}).(bool)
 	return ok && v

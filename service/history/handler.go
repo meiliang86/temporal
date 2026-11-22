@@ -67,6 +67,7 @@ import (
 	"go.temporal.io/server/service/history/replication"
 	"go.temporal.io/server/service/history/shard"
 	"go.temporal.io/server/service/history/tasks"
+	"go.temporal.io/server/service/history/workflow"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
 	"go.uber.org/fx"
 	"google.golang.org/grpc/health"
@@ -2010,6 +2011,8 @@ func (h *Handler) GetWorkflowExecutionRawHistory(
 		return nil, h.convertError(err)
 	}
 
+	// Serves another cluster's replication (backfill), possibly for a transaction waiting on it.
+	ctx = workflow.WithSyncReplicationReaderIfEnabled(ctx, shardContext, namespace.ID(request.GetNamespaceId()))
 	return engine.GetWorkflowExecutionRawHistory(ctx, request)
 }
 
@@ -2030,6 +2033,8 @@ func (h *Handler) GetWorkflowExecutionRawHistoryV2(
 		return nil, h.convertError(err)
 	}
 
+	// Serves another cluster's replication (backfill), possibly for a transaction waiting on it.
+	ctx = workflow.WithSyncReplicationReaderIfEnabled(ctx, shardContext, namespace.ID(request.GetNamespaceId()))
 	return engine.GetWorkflowExecutionRawHistoryV2(ctx, request)
 }
 
@@ -2373,6 +2378,8 @@ func (h *Handler) SyncWorkflowState(ctx context.Context, request *historyservice
 		return nil, h.convertError(err)
 	}
 
+	// Serves another cluster's replication (resend), possibly for a transaction waiting on it.
+	ctx = workflow.WithSyncReplicationReaderIfEnabled(ctx, shardContext, namespaceID)
 	response, err := engine.SyncWorkflowState(ctx, request)
 	if err != nil {
 		return nil, h.convertError(err)
