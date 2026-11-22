@@ -1,0 +1,15 @@
+# Acknowledge replication progress right after tasks are applied (both clusters).
+history.ReplicationStreamEagerSyncStatusInterval:
+  - value: 5ms
+system.forceSearchAttributesCacheRefreshOnRead:
+  - value: true
+frontend.rps:
+  - value: 20000
+frontend.namespaceRPS:
+  - value: 20000
+frontend.namespaceCount:
+  - value: 20000
+history.rps:
+  - value: 20000
+matching.rps:
+  - value: 20000
