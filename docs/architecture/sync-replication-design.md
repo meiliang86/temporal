@@ -34,6 +34,9 @@ Agreed scope for the first implementation. Later sections describe the full desi
   - every duplicate-detection key lives in replicated mutable state (audit required),
   - an uncommitted write discarded at failover executes fresh on the new active.
 - **Rollback is per workflow.** A pending sync write blocks everything behind it, so each workflow's uncommitted tail on the old active is well defined. With everything sync, the whole tail is uncommitted sync writes, and it is discarded.
+- **One ack watermark (no durable-watermark work).** v1 counts the existing progress watermark as the commit ack. A task that goes to the replication DLQ still advances it, so a write can be treated as committed while that standby is missing it. If the standby is then promoted, that write is lost.
+  - **Mitigation:** any replication DLQ entry for a sync namespace is a page-level alert. The DLQ'd workflows are re-replicated before that standby is eligible for a clean promote.
+  - The proper fix is logged as future work (§10).
 - **The control plane is push-only.** It calls the data plane: `ApplyReplicationGroupState` for decisions and lease renewals, plus health, lag and applied-version reads. The data plane never calls the control plane.
 - **Failure detection is external.** The failure detector and the control plane make all membership and failover decisions, including human overrides, through the control plane's serialized record (§5.3–5.4). The data plane keeps only local safety reflexes: stop when the lease expires, demote when fenced, return `Unavailable` on a quorum-wait timeout.
 
@@ -83,7 +86,7 @@ With 3 clusters, `commit = max(ack[B], ack[C])`, so the faster peer sets the com
 
 Required changes to ack semantics:
 
-1. **A DLQ entry must not count as an ack.** Today a NACKed task becomes a poison pill and is dropped from the tracker, which advances the watermark (`executable_task_tracker.go:125`). For sync lanes, a DLQ'd task has to hold back that peer's durable watermark. Track a second "durable" watermark alongside the progress watermark.
+1. **A DLQ entry should not count as an ack** (*deferred to future work, §10*). Today a NACKed task becomes a poison pill and is dropped from the tracker, which advances the watermark (`executable_task_tracker.go:125`). The full fix is a second "durable" watermark that a DLQ'd task holds back. v1 keeps today's single watermark and accepts the gap (see the v1 decisions).
 2. **Acks must be event-driven.** Today the receiver acks on a 1s ticker (`stream_receiver.go:235`, `history.ReplicationStreamSyncStatusDuration`), which puts about 1s on every committed write. Ack as soon as the low watermark advances, coalesced over a few milliseconds.
 3. **Sender skip invariant.** The sender may skip a task, or advance `exclusive_high_watermark` past it, only if its content is already durable on the peer or is carried by a task with an ID at or below it. A task that is "covered by a later task" is **not** safe to skip on a sync lane: the watermark could move past it before the later task is applied. Every skip path (`stream_sender.go:546`, converter returning nil, and so on) needs an audit for this.
 4. **Sync namespaces go on dedicated isolated lanes**, so a stuck async-namespace task or force-replication backlog can't block their watermark. This reuses the existing lane mechanism with a "pinned" lane type that never retires.
@@ -381,8 +384,18 @@ Throughput: commits are per shard and per lane prefix, so they batch naturally. 
 
 ## 9. Suggested phases
 
-1. **Observability only:** compute `commit[s][ℓ]`, event-driven acks, a durable-vs-progress watermark, and metrics for "would-be gating delay". No behavior change, but it measures the latency cost on real traffic.
+1. **Observability only:** compute `commit[s][ℓ]`, event-driven acks, and metrics for "would-be gating delay", plus a DLQ alert for sync namespaces. No behavior change, but it measures the latency cost on real traffic.
 2. **Gating:** the sync-trigger policy and per-transaction classification (§3.6), persisted barrier, `CommitTracker`, the mutable-state gate in `LoadMutableState`, a lock-free push-on-commit replication sender, gates in queue executables and the history handler. Behind a per-namespace flag, with failover limited to the graceful handover path. This alone gives G1, G3 and G4, plus G2 for planned failovers.
 3. **Safe unplanned failover:** relay log, promote/fence RPCs, catch-up stream, rollback of the old leader, reapply off. This completes G2.
    - **2-cluster track:** ISR mode, the control-plane record, its CAS operations and the degraded lease, the `ApplyReplicationGroupState` admin API with per-shard applied versions and the reconcile loop, shrink/rejoin automation, the `DEGRADED` state and unclean promote (§5). This can ship before the majority-mode election, since ISR promotion needs no catch-up.
 4. **Latency work:** group commit per workflow, the durable-ack mode, witness replicas.
+
+## 10. Future work
+
+- **Durable ack watermark.** Track a "durable" watermark per (stream, lane) next to today's progress watermark. A task NACKed into the replication DLQ advances the progress watermark but holds back the durable one, and commit uses the durable watermark. That closes the v1 gap where a DLQ'd write counts as committed on a standby that doesn't have it. It also needs:
+  - a resolution path that releases the hold once the DLQ'd task is reprocessed or the workflow is re-replicated,
+  - a rule that a standby with an unresolved DLQ entry isn't counted, which the failure detector can apply by dropping it from the in-sync set.
+- **Selective sync per event type** (§3.6).
+- **Majority mode for N ≥ 3:** election, relay log and catch-up from a peer (§4.3–4.4), so commit waits for the fastest standby instead of the slowest.
+- **Per-business-ID active cluster** (active-active namespaces).
+- **Group commit per workflow**, the durable-ack relaxation, and witness replicas.
