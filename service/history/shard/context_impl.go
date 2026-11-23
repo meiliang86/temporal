@@ -157,6 +157,12 @@ type (
 		// of this shard may be waiting on. It starts just below this owner's first task ID range, which
 		// covers everything previous owners persisted.
 		syncReplicationBarrier  atomic.Int64
+
+		// acquiredNamespaces caches sync replication namespaces as read from the database after the
+		// shard's acquisition with range ID acquiredNamespacesRangeID (see SyncReplicationAcquiredNamespace).
+		acquiredNamespacesLock    sync.Mutex
+		acquiredNamespaces        map[namespace.ID]*namespace.Namespace
+		acquiredNamespacesRangeID int64
 		handoverTracker         HandoverTracker
 		acquireShardRetryPolicy backoff.RetryPolicy
 
@@ -561,6 +567,43 @@ func (s *ContextImpl) RecordSyncReplicationBarrier(taskID int64) {
 			return
 		}
 	}
+}
+
+// SyncReplicationAcquiredNamespace returns the namespace as read from the database after this shard was
+// last acquired, or nil if the namespace doesn't exist. Sync replication uses it as a lower bound of
+// the namespace's failover state, independent of this host's namespace cache:
+//
+// Every write made under a failover version comes from a host that had read that version from the
+// database, and once the shard is acquired, its previous owner can't write anymore. So the database
+// read made after the acquisition sees every failover version this shard was written under. A host
+// whose cache is behind it (it missed failovers while it didn't own the shard) must neither act as
+// active under the older version nor ack replication without fencing for the newer one.
+//
+// The database is read once per namespace per acquisition (range ID). The read also refreshes the
+// host's namespace cache.
+func (s *ContextImpl) SyncReplicationAcquiredNamespace(namespaceID namespace.ID) (*namespace.Namespace, error) {
+	// The range ID is read before the database: a read under the current range ID is made after the
+	// acquisition that set it.
+	rangeID := s.GetRangeID()
+	s.acquiredNamespacesLock.Lock()
+	defer s.acquiredNamespacesLock.Unlock()
+	if rangeID != s.acquiredNamespacesRangeID || s.acquiredNamespaces == nil {
+		s.acquiredNamespaces = make(map[namespace.ID]*namespace.Namespace)
+		s.acquiredNamespacesRangeID = rangeID
+	}
+	if entry, ok := s.acquiredNamespaces[namespaceID]; ok {
+		return entry, nil
+	}
+	entry, err := s.namespaceRegistry.RefreshNamespaceById(namespaceID)
+	if err != nil {
+		var notFound *serviceerror.NamespaceNotFound
+		if !errors.As(err, &notFound) {
+			return nil, err
+		}
+		entry = nil
+	}
+	s.acquiredNamespaces[namespaceID] = entry
+	return entry, nil
 }
 
 // SyncReplicationBarrier returns a replication task ID covering every transaction of this shard that

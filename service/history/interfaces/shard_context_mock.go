@@ -839,6 +839,21 @@ func (mr *MockShardContextMockRecorder) StateMachineRegistry() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateMachineRegistry", reflect.TypeOf((*MockShardContext)(nil).StateMachineRegistry))
 }
 
+// SyncReplicationAcquiredNamespace mocks base method.
+func (m *MockShardContext) SyncReplicationAcquiredNamespace(namespaceID namespace.ID) (*namespace.Namespace, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SyncReplicationAcquiredNamespace", namespaceID)
+	ret0, _ := ret[0].(*namespace.Namespace)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SyncReplicationAcquiredNamespace indicates an expected call of SyncReplicationAcquiredNamespace.
+func (mr *MockShardContextMockRecorder) SyncReplicationAcquiredNamespace(namespaceID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncReplicationAcquiredNamespace", reflect.TypeOf((*MockShardContext)(nil).SyncReplicationAcquiredNamespace), namespaceID)
+}
+
 // SyncReplicationBarrier mocks base method.
 func (m *MockShardContext) SyncReplicationBarrier() int64 {
 	m.ctrl.T.Helper()
@@ -1808,6 +1823,21 @@ func (m *MockControllableContext) StateMachineRegistry() *hsm.Registry {
 func (mr *MockControllableContextMockRecorder) StateMachineRegistry() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateMachineRegistry", reflect.TypeOf((*MockControllableContext)(nil).StateMachineRegistry))
+}
+
+// SyncReplicationAcquiredNamespace mocks base method.
+func (m *MockControllableContext) SyncReplicationAcquiredNamespace(namespaceID namespace.ID) (*namespace.Namespace, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SyncReplicationAcquiredNamespace", namespaceID)
+	ret0, _ := ret[0].(*namespace.Namespace)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SyncReplicationAcquiredNamespace indicates an expected call of SyncReplicationAcquiredNamespace.
+func (mr *MockControllableContextMockRecorder) SyncReplicationAcquiredNamespace(namespaceID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncReplicationAcquiredNamespace", reflect.TypeOf((*MockControllableContext)(nil).SyncReplicationAcquiredNamespace), namespaceID)
 }
 
 // SyncReplicationBarrier mocks base method.

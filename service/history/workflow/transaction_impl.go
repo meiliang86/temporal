@@ -370,6 +370,9 @@ func createWorkflowExecution(
 	isWorkflow bool,
 ) (*persistence.CreateWorkflowExecutionResponse, error) {
 
+	if err := checkSyncReplicationWrite(shardContext, request.NewWorkflowSnapshot.ExecutionInfo.NamespaceId, mutableStateFailoverVersion); err != nil {
+		return nil, err
+	}
 	resp, err := shardContext.CreateWorkflowExecution(ctx, request)
 	if err != nil {
 		switch err.(type) {
@@ -438,6 +441,9 @@ func conflictResolveWorkflowExecution(
 	isWorkflow bool,
 ) (*persistence.ConflictResolveWorkflowExecutionResponse, error) {
 
+	if err := checkSyncReplicationWrite(shardContext, request.ResetWorkflowSnapshot.ExecutionInfo.NamespaceId, resetWorkflowFailoverVersion); err != nil {
+		return nil, err
+	}
 	resp, err := shardContext.ConflictResolveWorkflowExecution(ctx, request)
 	if err != nil {
 		shardContext.GetLogger().Error(
@@ -553,6 +559,9 @@ func updateWorkflowExecution(
 	isWorkflow bool,
 ) (*persistence.UpdateWorkflowExecutionResponse, error) {
 
+	if err := checkSyncReplicationWrite(shardContext, request.UpdateWorkflowMutation.ExecutionInfo.NamespaceId, updateWorkflowFailoverVersion); err != nil {
+		return nil, err
+	}
 	resp, err := shardContext.UpdateWorkflowExecution(ctx, request)
 	if err != nil {
 		shardContext.GetLogger().Error(
@@ -619,6 +628,9 @@ func setWorkflowExecution(
 	request *persistence.SetWorkflowExecutionRequest,
 ) (*persistence.SetWorkflowExecutionResponse, error) {
 
+	if err := checkSyncReplicationWrite(shardContext, request.SetWorkflowSnapshot.ExecutionInfo.NamespaceId, lastWriteFailoverVersion(request.SetWorkflowSnapshot.ExecutionInfo)); err != nil {
+		return nil, err
+	}
 	resp, err := shardContext.SetWorkflowExecution(ctx, request)
 	if err != nil {
 		shardContext.GetLogger().Error(

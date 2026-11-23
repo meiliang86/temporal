@@ -126,6 +126,54 @@ func syncReplicationCommitClusters(
 	return remoteClusters
 }
 
+// checkSyncReplicationAcquiredVersion refuses to act as active for a sync replication namespace under
+// failoverVersion if the shard read a newer failover version of the namespace from the database at
+// its acquisition. The host's namespace cache is then behind: for example the shard just moved to a
+// host that missed a handover and a forced failover back. A write made under the old version could be
+// acknowledged (this cluster may be alone in the membership record by then) and later lost to a
+// branch made under a version in between.
+func checkSyncReplicationAcquiredVersion(
+	shardContext historyi.ShardContext,
+	namespaceEntry *namespace.Namespace,
+	failoverVersion int64,
+) error {
+	acquired, err := shardContext.SyncReplicationAcquiredNamespace(namespaceEntry.ID())
+	if err != nil {
+		return serviceerror.NewUnavailablef("sync replication: can't read namespace %s: %v", namespaceEntry.Name(), err)
+	}
+	if acquired == nil || acquired.FailoverVersion(namespace.EmptyBusinessID) <= failoverVersion {
+		return nil
+	}
+	currentCluster := shardContext.GetClusterMetadata().GetCurrentClusterName()
+	if activeCluster := acquired.ActiveClusterName(namespace.RoutingKey{}); activeCluster != currentCluster {
+		return serviceerror.NewNamespaceNotActive(namespaceEntry.Name().String(), currentCluster, activeCluster)
+	}
+	return serviceerror.NewUnavailablef(
+		"sync replication: namespace %s cache is at failover version %d, behind %d; retry",
+		namespaceEntry.Name(), failoverVersion, acquired.FailoverVersion(namespace.EmptyBusinessID),
+	)
+}
+
+// checkSyncReplicationWrite runs before a transaction is persisted. An active write of a sync
+// replication namespace must not be made under a failover version older than the one the shard read
+// at its acquisition (see checkSyncReplicationAcquiredVersion). Checking after persisting is too late:
+// a later load would expose the write.
+func checkSyncReplicationWrite(
+	shardContext historyi.ShardContext,
+	namespaceID string,
+	failoverVersion int64,
+) error {
+	namespaceEntry, err := shardContext.GetNamespaceRegistry().GetNamespaceByID(namespace.ID(namespaceID))
+	if err != nil || !isSyncReplicationNamespace(shardContext, namespaceEntry) {
+		return nil
+	}
+	clusterMetadata := shardContext.GetClusterMetadata()
+	if clusterMetadata.ClusterNameForFailoverVersion(namespaceEntry.IsGlobalNamespace(), failoverVersion) != clusterMetadata.GetCurrentClusterName() {
+		return nil // applying another cluster's writes
+	}
+	return checkSyncReplicationAcquiredVersion(shardContext, namespaceEntry, failoverVersion)
+}
+
 // maxReplicationTaskID returns the largest replication task ID in the given task maps, or 0 if there
 // is none. Task IDs are assigned by the shard when the transaction is persisted.
 func maxReplicationTaskID(taskMaps ...map[tasks.Category][]tasks.Task) int64 {

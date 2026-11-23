@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,6 +80,10 @@ func newSyncReplicationTestShardWithNamespace(t *testing.T, enabled bool, entry 
 	shardContext.EXPECT().GetClusterMetadata().Return(clusterMetadata).AnyTimes()
 	shardContext.EXPECT().GetNamespaceRegistry().Return(namespaceRegistry).AnyTimes()
 	shardContext.EXPECT().GetMetricsHandler().Return(metrics.NoopMetricsHandler).AnyTimes()
+	// By default the database read at the shard's acquisition matches the cache.
+	shardContext.EXPECT().SyncReplicationAcquiredNamespace(tests.NamespaceID).DoAndReturn(
+		func(namespace.ID) (*namespace.Namespace, error) { return entry(), nil },
+	).AnyTimes()
 	return shardContext
 }
 
@@ -414,4 +419,76 @@ func TestWithSyncReplicationReaderIfEnabled(t *testing.T) {
 
 	disabled := newSyncReplicationTestShard(t, false)
 	require.False(t, isSyncReplicationReader(WithSyncReplicationReaderIfEnabled(context.Background(), disabled, tests.NamespaceID)))
+}
+
+// A shard whose host's namespace cache is behind the database read at the shard's acquisition must not
+// act as active under the cache's version.
+func TestSyncReplicationAcquisitionGate(t *testing.T) {
+	nsID := tests.NamespaceID.String()
+	newShard := func(t *testing.T, acquired *namespace.Namespace, readErr error) *historyi.MockShardContext {
+		controller := gomock.NewController(t)
+		config := tests.NewDynamicConfig()
+		config.SyncReplicationEnabled = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true)
+		clusterMetadata := cluster.NewMockMetadata(controller)
+		clusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+		clusterMetadata.EXPECT().ClusterNameForFailoverVersion(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ bool, version int64) string {
+				if version == remoteVersion {
+					return cluster.TestAlternativeClusterName
+				}
+				return cluster.TestCurrentClusterName
+			},
+		).AnyTimes()
+		namespaceRegistry := namespace.NewMockRegistry(controller)
+		namespaceRegistry.EXPECT().GetNamespaceByID(tests.NamespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
+		shardContext := historyi.NewMockShardContext(controller)
+		shardContext.EXPECT().GetConfig().Return(config).AnyTimes()
+		shardContext.EXPECT().GetClusterMetadata().Return(clusterMetadata).AnyTimes()
+		shardContext.EXPECT().GetNamespaceRegistry().Return(namespaceRegistry).AnyTimes()
+		shardContext.EXPECT().SyncReplicationAcquiredNamespace(tests.NamespaceID).Return(acquired, readErr).AnyTimes()
+		return shardContext
+	}
+	withVersion := func(activeCluster string, version int64) *namespace.Namespace {
+		return namespace.NewGlobalNamespaceForTest(
+			&persistencespb.NamespaceInfo{Id: nsID, Name: tests.Namespace.String()},
+			&persistencespb.NamespaceConfig{},
+			&persistencespb.NamespaceReplicationConfig{
+				ActiveClusterName: activeCluster,
+				Clusters:          []string{cluster.TestCurrentClusterName, cluster.TestAlternativeClusterName},
+			},
+			version,
+		)
+	}
+
+	// The database agrees with the cache (or is older): the write goes ahead.
+	require.NoError(t, checkSyncReplicationWrite(newShard(t, withVersion(cluster.TestCurrentClusterName, localVersion), nil), nsID, localVersion))
+	require.NoError(t, checkSyncReplicationWrite(newShard(t, nil, nil), nsID, localVersion))
+
+	// The host missed a failover to the other cluster: not active.
+	err := checkSyncReplicationWrite(newShard(t, withVersion(cluster.TestAlternativeClusterName, localVersion+11), nil), nsID, localVersion)
+	var notActive *serviceerror.NamespaceNotActive
+	require.ErrorAs(t, err, &notActive)
+	require.Equal(t, cluster.TestAlternativeClusterName, notActive.ActiveCluster)
+
+	// The host missed a failover away and back: still active here, but not under the old version.
+	err = checkSyncReplicationWrite(newShard(t, withVersion(cluster.TestCurrentClusterName, localVersion+20), nil), nsID, localVersion)
+	var unavailable *serviceerror.Unavailable
+	require.ErrorAs(t, err, &unavailable)
+
+	// The database can't be read: refuse rather than risk it.
+	err = checkSyncReplicationWrite(newShard(t, nil, errors.New("database unavailable")), nsID, localVersion)
+	require.ErrorAs(t, err, &unavailable)
+
+	// Applying the other cluster's writes is never gated.
+	require.NoError(t, checkSyncReplicationWrite(newShard(t, withVersion(cluster.TestCurrentClusterName, localVersion+20), nil), nsID, remoteVersion))
+
+	// Nor are namespaces without sync replication.
+	disabled := newSyncReplicationTestShard(t, false)
+	require.NoError(t, checkSyncReplicationWrite(disabled, nsID, localVersion))
+
+	// Loads apply the same check against the cache's failover version.
+	require.ErrorAs(t,
+		checkSyncReplicationAcquiredVersion(newShard(t, withVersion(cluster.TestCurrentClusterName, localVersion+20), nil), tests.GlobalNamespaceEntry, localVersion),
+		&unavailable,
+	)
 }

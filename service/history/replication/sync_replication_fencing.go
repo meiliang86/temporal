@@ -1,11 +1,9 @@
 package replication
 
 import (
-	"errors"
 	"sync"
 	"time"
 
-	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/testing/testhooks"
@@ -29,12 +27,10 @@ const syncReplicationNamespaceListTTL = time.Second
 // The notice must reflect every failover under which this cluster wrote to the shard. The host's
 // namespace cache isn't enough: a shard can move to a host whose cache hasn't seen the failover yet,
 // right after the previous owner wrote under the new version. That host would ignore the old
-// active's tasks without fencing them. So whenever the local shard is (re)acquired, which its range
-// ID tells, the fencer reads the namespaces from the database. Any write made under a failover
-// version came from a host that had already read that version from the database, and the previous
-// owner can't write once the shard is acquired. So the database read, made after the acquisition,
-// sees every version the shard was written under. The notice uses whichever of the cache and that
-// read is newer.
+// active's tasks without fencing them. So the notice uses whichever is newer of the cache and the
+// namespace as the shard read it from the database after its acquisition
+// (ShardContext.SyncReplicationAcquiredNamespace), which sees every version the shard was written
+// under.
 type syncReplicationFencer struct {
 	config          *configs.Config
 	clusterMetadata cluster.Metadata
@@ -47,10 +43,6 @@ type syncReplicationFencer struct {
 	mu           sync.Mutex
 	namespaceIDs []namespace.ID
 	listedAt     time.Time
-	// acquiredView holds the namespaces as read from the database after the shard's acquisition
-	// with range ID acquiredRangeID.
-	acquiredView    map[namespace.ID]*namespace.Namespace
-	acquiredRangeID int64
 }
 
 func newSyncReplicationFencer(
@@ -72,7 +64,6 @@ func newSyncReplicationFencer(
 		shardID:         shardID,
 		testHooks:       testHooks,
 		now:             time.Now,
-		acquiredRangeID: -1,
 	}
 }
 
@@ -90,14 +81,18 @@ func (f *syncReplicationFencer) activeNamespaceFailoverVersions() (map[string]in
 	if len(namespaceIDs) == 0 {
 		return nil, nil
 	}
-	if err := f.refreshAcquiredViewLocked(namespaceIDs); err != nil {
+	shardContext, err := f.shardController.GetShardByID(f.shardID)
+	if err != nil {
 		return nil, err
 	}
 
 	currentCluster := f.clusterMetadata.GetCurrentClusterName()
 	var versions map[string]int64
 	for _, namespaceID := range namespaceIDs {
-		entry := f.acquiredView[namespaceID]
+		entry, err := shardContext.SyncReplicationAcquiredNamespace(namespaceID)
+		if err != nil {
+			return nil, err
+		}
 		if cached := f.cachedNamespace(namespaceID); cached != nil &&
 			(entry == nil || cached.FailoverVersion(namespace.EmptyBusinessID) >= entry.FailoverVersion(namespace.EmptyBusinessID)) {
 			entry = cached
@@ -123,36 +118,6 @@ func (f *syncReplicationFencer) cachedNamespace(namespaceID namespace.ID) *names
 		return nil
 	}
 	return entry
-}
-
-// refreshAcquiredViewLocked reads the namespaces from the database if the local shard was acquired
-// since the last read, and reads any namespace not read since.
-func (f *syncReplicationFencer) refreshAcquiredViewLocked(namespaceIDs []namespace.ID) error {
-	shardContext, err := f.shardController.GetShardByID(f.shardID)
-	if err != nil {
-		return err
-	}
-	if rangeID := shardContext.GetRangeID(); rangeID != f.acquiredRangeID {
-		f.acquiredView = make(map[namespace.ID]*namespace.Namespace, len(namespaceIDs))
-		f.acquiredRangeID = rangeID
-	}
-	for _, namespaceID := range namespaceIDs {
-		if _, ok := f.acquiredView[namespaceID]; ok {
-			continue
-		}
-		entry, err := f.registry.RefreshNamespaceById(namespaceID)
-		if err != nil {
-			var notFound *serviceerror.NamespaceNotFound
-			if errors.As(err, &notFound) {
-				continue // deleted: nothing to fence
-			}
-			// Read again on the next ack, under whatever range ID the shard has then.
-			f.acquiredRangeID = -1
-			return err
-		}
-		f.acquiredView[namespaceID] = entry
-	}
-	return nil
 }
 
 func (f *syncReplicationFencer) syncReplicationNamespaceIDsLocked() []namespace.ID {

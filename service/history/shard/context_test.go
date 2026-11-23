@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +14,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
@@ -1755,4 +1756,39 @@ func (s *contextSuite) TestOldestImmediateTaskVisibilityTime() {
 		_, ok := s.mockShard.oldestImmediateTaskVisibilityTime(tasks.CategoryTransfer, minKey, maxKey)
 		s.False(ok)
 	})
+}
+
+func (s *contextSuite) TestSyncReplicationAcquiredNamespace() {
+	setRangeID := func(rangeID int64) {
+		s.mockShard.wLock()
+		s.mockShard.shardInfo.RangeId = rangeID
+		s.mockShard.wUnlock()
+	}
+	setRangeID(5)
+
+	// Read from the database once per acquisition.
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(tests.NamespaceID).Return(tests.GlobalNamespaceEntry, nil).Times(1)
+	for range 3 {
+		entry, err := s.mockShard.SyncReplicationAcquiredNamespace(tests.NamespaceID)
+		s.NoError(err)
+		s.Equal(tests.GlobalNamespaceEntry, entry)
+	}
+
+	// The shard is acquired again: read again, the database has moved on.
+	setRangeID(6)
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(tests.NamespaceID).Return(tests.GlobalStandbyNamespaceEntry, nil).Times(1)
+	entry, err := s.mockShard.SyncReplicationAcquiredNamespace(tests.NamespaceID)
+	s.NoError(err)
+	s.Equal(tests.GlobalStandbyNamespaceEntry, entry)
+
+	// Errors aren't cached; a namespace missing from the database is.
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(tests.ParentNamespaceID).Return(nil, errors.New("database unavailable")).Times(1)
+	_, err = s.mockShard.SyncReplicationAcquiredNamespace(tests.ParentNamespaceID)
+	s.Error(err)
+	s.mockNamespaceCache.EXPECT().RefreshNamespaceById(tests.ParentNamespaceID).Return(nil, serviceerror.NewNamespaceNotFound("parent")).Times(1)
+	for range 2 {
+		entry, err = s.mockShard.SyncReplicationAcquiredNamespace(tests.ParentNamespaceID)
+		s.NoError(err)
+		s.Nil(entry)
+	}
 }

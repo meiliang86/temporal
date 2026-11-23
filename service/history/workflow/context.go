@@ -558,6 +558,17 @@ func (c *ContextImpl) waitForLoadedStateSyncReplication(
 	shardContext historyi.ShardContext,
 	namespaceEntry *namespace.Namespace,
 ) error {
+	if !isSyncReplicationNamespace(shardContext, namespaceEntry) ||
+		namespaceEntry.ActiveClusterName(namespace.RoutingKey{ID: c.workflowKey.WorkflowID}) != shardContext.GetClusterMetadata().GetCurrentClusterName() {
+		return nil
+	}
+	// Don't expose state as active while this host's namespace cache is behind the shard's
+	// acquisition read (also in degraded mode, where nothing is waited for).
+	if err := checkSyncReplicationAcquiredVersion(
+		shardContext, namespaceEntry, namespaceEntry.FailoverVersion(c.workflowKey.WorkflowID),
+	); err != nil {
+		return err
+	}
 	clusters := SyncReplicationClusters(shardContext, namespaceEntry, c.workflowKey.WorkflowID)
 	if len(clusters) == 0 {
 		return nil

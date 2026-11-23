@@ -95,6 +95,9 @@ type (
 		// SyncReplicationBarrier returns a replication task ID covering every transaction of this shard
 		// that sync replication may not have acknowledged yet.
 		SyncReplicationBarrier() int64
+		// SyncReplicationAcquiredNamespace returns the namespace as read from the database after this
+		// shard was last acquired, or nil if it doesn't exist.
+		SyncReplicationAcquiredNamespace(namespaceID namespace.ID) (*namespace.Namespace, error)
 
 		SetCurrentTime(cluster string, currentTime time.Time)
 		GetCurrentTime(cluster string) time.Time

@@ -23,7 +23,6 @@ type fencerTestEnv struct {
 	stored  map[namespace.ID]*namespace.Namespace // the database
 	dbReads map[namespace.ID]int
 	dbErr   error
-	rangeID int64
 	listed  int
 	now     time.Time
 	enabled func(string) bool
@@ -44,7 +43,6 @@ func newFencerTestEnv(t *testing.T, hooks testhooks.TestHooks) *fencerTestEnv {
 		cached:  map[namespace.ID]*namespace.Namespace{},
 		stored:  map[namespace.ID]*namespace.Namespace{},
 		dbReads: map[namespace.ID]int{},
-		rangeID: 1,
 		now:     time.Unix(1000, 0),
 		enabled: func(name string) bool { return name != "active-async" },
 	}
@@ -63,22 +61,19 @@ func newFencerTestEnv(t *testing.T, hooks testhooks.TestHooks) *fencerTestEnv {
 		}
 		return nil, serviceerror.NewNamespaceNotFound(id.String())
 	}).AnyTimes()
-	registry.EXPECT().RefreshNamespaceById(gomock.Any()).DoAndReturn(func(id namespace.ID) (*namespace.Namespace, error) {
-		env.dbReads[id]++
-		if env.dbErr != nil {
-			return nil, env.dbErr
-		}
-		if entry, ok := env.stored[id]; ok {
-			return entry, nil
-		}
-		return nil, serviceerror.NewNamespaceNotFound(id.String())
-	}).AnyTimes()
 
 	clusterMetadata := cluster.NewMockMetadata(controller)
 	clusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
 
+	// The shard's acquisition read (cached per acquisition by the shard, see its tests).
 	shardContext := historyi.NewMockShardContext(controller)
-	shardContext.EXPECT().GetRangeID().DoAndReturn(func() int64 { return env.rangeID }).AnyTimes()
+	shardContext.EXPECT().SyncReplicationAcquiredNamespace(gomock.Any()).DoAndReturn(func(id namespace.ID) (*namespace.Namespace, error) {
+		env.dbReads[id]++
+		if env.dbErr != nil {
+			return nil, env.dbErr
+		}
+		return env.stored[id], nil
+	}).AnyTimes()
 	shardController := shard.NewMockController(controller)
 	shardController.EXPECT().GetShardByID(int32(7)).Return(shardContext, nil).AnyTimes()
 
@@ -108,17 +103,15 @@ func TestSyncReplicationFencer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, map[string]int64{"active-sync": 11}, versions)
 	require.Equal(t, 1, env.listed)
-	require.Equal(t, map[namespace.ID]int{"active-sync": 1, "standby-sync": 1}, env.dbReads)
 
-	// Failover, seen by the cache. Active state and versions are read for every ack, without waiting
-	// for the namespace list to be refreshed, and the database isn't read again.
+	// Failover, seen by the cache and the database. Active state and versions are read for every ack,
+	// without waiting for the namespace list to be refreshed.
 	env.set(newFencerNamespace("standby-sync", current, 22, current, alternative))
 	env.set(newFencerNamespace("active-sync", alternative, 21, current, alternative))
 	versions, err = env.fencer.activeNamespaceFailoverVersions()
 	require.NoError(t, err)
 	require.Equal(t, map[string]int64{"standby-sync": 22}, versions)
 	require.Equal(t, 1, env.listed)
-	require.Equal(t, map[namespace.ID]int{"active-sync": 1, "standby-sync": 1}, env.dbReads)
 
 	// A namespace that turns sync is picked up when the list is refreshed, and read from the database.
 	env.enabled = func(string) bool { return true }
@@ -130,7 +123,6 @@ func TestSyncReplicationFencer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, map[string]int64{"standby-sync": 22, "active-async": 13}, versions)
 	require.Equal(t, 2, env.listed)
-	require.Equal(t, 1, env.dbReads["active-async"])
 
 	// A fencer without a registry or shard controller sends no notice.
 	versions, err = (*syncReplicationFencer)(nil).activeNamespaceFailoverVersions()
@@ -155,32 +147,6 @@ func TestSyncReplicationFencer_StaleCacheAfterShardAcquisition(t *testing.T) {
 	versions, err = env.fencer.activeNamespaceFailoverVersions()
 	require.NoError(t, err)
 	require.Empty(t, versions)
-	require.Equal(t, 1, env.dbReads["ns"])
-}
-
-func TestSyncReplicationFencer_ReadsDatabaseOnEveryAcquisition(t *testing.T) {
-	current, alternative := cluster.TestCurrentClusterName, cluster.TestAlternativeClusterName
-	env := newFencerTestEnv(t, testhooks.TestHooks{})
-	env.set(newFencerNamespace("ns", alternative, 11, current, alternative))
-
-	versions, err := env.fencer.activeNamespaceFailoverVersions()
-	require.NoError(t, err)
-	require.Empty(t, versions)
-	versions, err = env.fencer.activeNamespaceFailoverVersions()
-	require.NoError(t, err)
-	require.Empty(t, versions)
-	require.Equal(t, 1, env.dbReads["ns"])
-
-	// Failover in the database only; then the shard is acquired again (new range ID).
-	env.stored["ns"] = newFencerNamespace("ns", current, 22, current, alternative)
-	versions, err = env.fencer.activeNamespaceFailoverVersions()
-	require.NoError(t, err)
-	require.Empty(t, versions, "same acquisition: the database isn't read again")
-	env.rangeID++
-	versions, err = env.fencer.activeNamespaceFailoverVersions()
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"ns": 22}, versions)
-	require.Equal(t, 2, env.dbReads["ns"])
 }
 
 func TestSyncReplicationFencer_DatabaseErrors(t *testing.T) {
@@ -199,9 +165,8 @@ func TestSyncReplicationFencer_DatabaseErrors(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, map[string]int64{"ns": 22}, versions)
 
-	// A namespace deleted from the database has nothing to fence.
+	// A namespace missing from the database: the cache alone decides.
 	delete(env.stored, "ns")
-	env.rangeID++
 	versions, err = env.fencer.activeNamespaceFailoverVersions()
 	require.NoError(t, err)
 	require.Empty(t, versions)
