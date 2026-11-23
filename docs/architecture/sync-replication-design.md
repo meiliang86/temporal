@@ -55,7 +55,13 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
   - `version` (stale or duplicate pushes are ignored).
 - **Commit rule:** a write commits when `required_acks` members of the in-sync set other than the active have acknowledged it. With in-sync = {active} (degraded), it commits locally.
 - **Failover only to an in-sync cluster.** Automatic failover (planned or forced) targets only a member of the in-sync set. A double failure (the standby was dropped, then the active fails) leaves the namespace unavailable until the active returns. The plain forced failover remains a manual escape hatch: an operator guarantees the old active is down and accepts losing its degraded-period writes. No lease is needed, because a degraded active is never replaced automatically.
-- **Fencing notice:** once a cluster is active for namespace N at failover version v, every replication ack it sends to another cluster carries "N is at v". That cluster then stops counting those acks for N, fails pending commits immediately, and rejects new writes with `NamespaceNotActive` naming the new active. The notice travels in the same message as the watermark it covers.
+- **Fencing notice:** once a cluster is active for namespace N at failover version v, every replication ack it sends to another cluster carries "N is at v". The notice travels in the same message as the watermark it covers. The receiving cluster:
+  - counts an ack toward a write only if the notice is **not newer than the failover version the write was made under**. The check is per write, not against the receiver's current version; the model checker found the latter unsafe;
+  - fails pending commits of writes made under older versions immediately;
+  - rejects new writes with `NamespaceNotActive` naming the new active.
+- **Term rule** (Raft's "commit only current-term entries", found by the model checker). An active commits, or exposes through reads, only writes made under its current failover version. Older writes become durable when a later write under the current version commits. So:
+  - waiters for writes from an older version fail;
+  - before a new active exposes a workflow whose last write is older than its current failover version, it commits a version-bump transition (Raft's no-op entry). Without this, after failovers A → B → A, a stale write from B at an intermediate version can replace a write A had already acknowledged.
 
 ### Flows
 
@@ -92,10 +98,14 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 | Election | Implicit (one follower) | Prepare/promise step before `UpdateNamespace(active)` |
 | Catch-up | Not needed | Follower record of applied writes; pull from the other follower before activating |
 
+### Verification
+
+`sync-replication-model/` holds an exhaustive model checker for this protocol, with results and counterexamples. All invariants hold within the checked bounds. Seven deliberately broken variants are each caught, including the two rules above.
+
 ### Build order
 
 1. Test planned failover on a sync namespace.
-2. Fencing notice and its handling; test a forced failover with A partitioned.
+2. Fencing notice and its handling (per-write check), plus the term rule (old-version waiters fail; version bump before exposing); test a forced failover with A partitioned.
 3. In-sync state storage and the two admin RPCs (proto changes).
 4. Commit by in-sync set; degraded mode.
 5. Rejoin status (`caught_up`, `drained_to`); full A → B → A test.
