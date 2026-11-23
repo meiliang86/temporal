@@ -32,24 +32,14 @@ type syncReplicationTestSuite struct {
 
 func TestSyncReplicationTestSuite(t *testing.T) {
 	t.Parallel()
+	// Sync replication supports state-based replication only (transition history on).
 	for _, clusterCount := range []int{2, 3} {
-		for _, tc := range []struct {
-			name                    string
-			enableTransitionHistory bool
-		}{
-			// Event-based replication: tasks are usually built from cached event blobs.
-			{name: "DisableTransitionHistory", enableTransitionHistory: false},
-			// State-based replication: every task is built from the mutable state, under the workflow
-			// lock that the waiting writer hands off.
-			{name: "EnableTransitionHistory", enableTransitionHistory: true},
-		} {
-			t.Run(fmt.Sprintf("%dClusters/%s", clusterCount, tc.name), func(t *testing.T) {
-				s := &syncReplicationTestSuite{}
-				s.enableTransitionHistory = tc.enableTransitionHistory
-				s.clusterNames = []string{"active", "standby1", "standby2"}[:clusterCount]
-				suite.Run(t, s)
-			})
-		}
+		t.Run(fmt.Sprintf("%dClusters", clusterCount), func(t *testing.T) {
+			s := &syncReplicationTestSuite{}
+			s.enableTransitionHistory = true
+			s.clusterNames = []string{"active", "standby1", "standby2"}[:clusterCount]
+			suite.Run(t, s)
+		})
 	}
 }
 

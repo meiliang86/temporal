@@ -10,12 +10,15 @@ import (
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
-	"go.temporal.io/server/common/persistence/versionhistory"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/tasks"
 )
 
 // Sync replication (experimental, see docs/architecture/sync-replication-design.md on the design branch).
+//
+// Supported only with state-based replication (history.enableTransitionHistory) over replication
+// streams (history.enableReplicationStream): fencing notices travel on stream acks. With either off,
+// active writes of a sync replication namespace are refused rather than silently made async.
 //
 // For a namespace with history.syncReplicationEnabled, the active cluster persists each workflow
 // transaction locally and then waits until every other cluster of the namespace has acknowledged
@@ -171,7 +174,23 @@ func checkSyncReplicationWrite(
 	if clusterMetadata.ClusterNameForFailoverVersion(namespaceEntry.IsGlobalNamespace(), failoverVersion) != clusterMetadata.GetCurrentClusterName() {
 		return nil // applying another cluster's writes
 	}
+	if err := checkSyncReplicationSupported(shardContext, namespaceEntry); err != nil {
+		return err
+	}
 	return checkSyncReplicationAcquiredVersion(shardContext, namespaceEntry, failoverVersion)
+}
+
+// checkSyncReplicationSupported fails if the namespace enables sync replication without what it
+// requires: state-based replication, over replication streams.
+func checkSyncReplicationSupported(shardContext historyi.ShardContext, namespaceEntry *namespace.Namespace) error {
+	config := shardContext.GetConfig()
+	if !config.EnableTransitionHistory(namespaceEntry.Name().String()) || !config.EnableReplicationStream() {
+		return serviceerror.NewFailedPreconditionf(
+			"sync replication of namespace %s requires history.enableTransitionHistory and history.enableReplicationStream",
+			namespaceEntry.Name(),
+		)
+	}
+	return nil
 }
 
 // maxReplicationTaskID returns the largest replication task ID in the given task maps, or 0 if there
@@ -187,23 +206,12 @@ func maxReplicationTaskID(taskMaps ...map[tasks.Category][]tasks.Task) int64 {
 }
 
 // lastWriteFailoverVersion returns the failover version of the last write recorded in a persisted
-// workflow snapshot.
+// workflow snapshot, from its transition history (sync replication requires state-based replication).
 func lastWriteFailoverVersion(executionInfo *persistencespb.WorkflowExecutionInfo) int64 {
 	if transitions := executionInfo.GetTransitionHistory(); len(transitions) > 0 {
 		return transitions[len(transitions)-1].GetNamespaceFailoverVersion()
 	}
-	if executionInfo.GetVersionHistories() == nil {
-		return common.EmptyVersion
-	}
-	currentHistory, err := versionhistory.GetCurrentVersionHistory(executionInfo.GetVersionHistories())
-	if err != nil {
-		return common.EmptyVersion
-	}
-	lastItem, err := versionhistory.GetLastVersionHistoryItem(currentHistory)
-	if err != nil {
-		return common.EmptyVersion
-	}
-	return lastItem.GetVersion()
+	return common.EmptyVersion
 }
 
 // waitForSyncReplication blocks, after a transaction of the given workflow is persisted, until the

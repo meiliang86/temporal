@@ -193,20 +193,17 @@ func TestSyncReplicationCommitClusters(t *testing.T) {
 }
 
 func TestLastWriteFailoverVersion(t *testing.T) {
-	require.Equal(t, int64(7), lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{
-		VersionHistories: versionhistory.NewVersionHistories(versionhistory.NewVersionHistory(nil, []*historyspb.VersionHistoryItem{
-			versionhistory.NewVersionHistoryItem(3, 5),
-			versionhistory.NewVersionHistoryItem(9, 7),
-		})),
-	}))
 	require.Equal(t, int64(11), lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{
-		VersionHistories: versionhistory.NewVersionHistories(versionhistory.NewVersionHistory(nil, []*historyspb.VersionHistoryItem{
-			versionhistory.NewVersionHistoryItem(9, 7),
-		})),
 		TransitionHistory: []*persistencespb.VersionedTransition{
 			{NamespaceFailoverVersion: 7, TransitionCount: 3},
 			{NamespaceFailoverVersion: 11, TransitionCount: 4},
 		},
+	}))
+	// Event history alone isn't used: sync replication requires state-based replication.
+	require.Equal(t, common.EmptyVersion, lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{
+		VersionHistories: versionhistory.NewVersionHistories(versionhistory.NewVersionHistory(nil, []*historyspb.VersionHistoryItem{
+			versionhistory.NewVersionHistoryItem(9, 7),
+		})),
 	}))
 	require.Equal(t, common.EmptyVersion, lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{}))
 }
@@ -425,10 +422,13 @@ func TestWithSyncReplicationReaderIfEnabled(t *testing.T) {
 // act as active under the cache's version.
 func TestSyncReplicationAcquisitionGate(t *testing.T) {
 	nsID := tests.NamespaceID.String()
+	stateBased, streams := true, true
 	newShard := func(t *testing.T, acquired *namespace.Namespace, readErr error) *historyi.MockShardContext {
 		controller := gomock.NewController(t)
 		config := tests.NewDynamicConfig()
 		config.SyncReplicationEnabled = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true)
+		config.EnableTransitionHistory = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(stateBased)
+		config.EnableReplicationStream = dynamicconfig.GetBoolPropertyFn(streams)
 		clusterMetadata := cluster.NewMockMetadata(controller)
 		clusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
 		clusterMetadata.EXPECT().ClusterNameForFailoverVersion(gomock.Any(), gomock.Any()).DoAndReturn(
@@ -485,6 +485,17 @@ func TestSyncReplicationAcquisitionGate(t *testing.T) {
 	// Nor are namespaces without sync replication.
 	disabled := newSyncReplicationTestShard(t, false)
 	require.NoError(t, checkSyncReplicationWrite(disabled, nsID, localVersion))
+
+	// Sync replication without state-based replication or without streams: active writes are
+	// refused, not made async.
+	current := withVersion(cluster.TestCurrentClusterName, localVersion)
+	var failedPrecondition *serviceerror.FailedPrecondition
+	stateBased = false
+	require.ErrorAs(t, checkSyncReplicationWrite(newShard(t, current, nil), nsID, localVersion), &failedPrecondition)
+	require.NoError(t, checkSyncReplicationWrite(newShard(t, current, nil), nsID, remoteVersion))
+	stateBased, streams = true, false
+	require.ErrorAs(t, checkSyncReplicationWrite(newShard(t, current, nil), nsID, localVersion), &failedPrecondition)
+	streams = true
 
 	// Loads apply the same check against the cache's failover version.
 	require.ErrorAs(t,
