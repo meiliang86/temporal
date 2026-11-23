@@ -136,7 +136,11 @@ Branch `sync-replication/v1-blocking`. The control plane is external; the data p
 Known limits:
 
 1. **The fence is conservative.** It is checked when the write is evaluated, against the highest version received so far. During a handover, a write acked just before the new active's first fenced ack could be reported as failed although the new active has it. A retry with the same request ID reaches the new active and finds it.
-2. **The fence comes from the receiving host's namespace registry.** Suppose a standby shard moves to a host whose registry hasn't seen the failover yet, right after the new active wrote on it. That host could ignore an old-active task, as a stale branch, and ack it without a fence. Closing this needs the fence derived from task application (ignored as stale, then report the local version), or a registry refresh on shard acquisition. The window is about the 2 s registry refresh, and it needs a zombie old active that is still connected.
+2. **Fixed: a new shard owner with a stale namespace cache.** The fence used to come only from the acking host's namespace cache. Suppose a standby shard moved, right after the new active wrote on it, to a host whose cache hadn't seen the failover. That host would ignore the zombie old active's tasks as stale branches and ack them without a fence. A functional test reproduced it: the old active acknowledged completing a workflow that the in-sync cluster still had running. Now the fencer reads the sync namespaces from the database whenever the local shard's range ID changes, so on every acquisition. It fences with whichever of that read and the cache is newer. This is enough because:
+   - every write under a failover version comes from a host that already read that version from the database;
+   - the previous owner can't write once the shard is acquired.
+
+   A failed read skips the ack, which is retried. The model checker missed this because it gives each cluster a single view of the namespace.
 
 Tests (`tests/xdc/sync_replication_failover_test.go`, two clusters, with and without transition history):
 
@@ -145,6 +149,7 @@ Tests (`tests/xdc/sync_replication_failover_test.go`, two clusters, with and wit
 | `MembershipRecordIsLocalAndVersioned` | Per-cluster records; stale and duplicate pushes; validation; namespace update, its replication, and failover keep the records |
 | `DegradedModeAndRejoin` | Standby stops applying: writes time out. A write already waiting commits when the record drops the standby. Degraded writes commit alone. Rejoin step 1 blocks again. Catch-up: `drained`, and every write is on the standby. Step 2 |
 | `PlannedFailoverAndFailback` | Handover A → B: B waits for A. A receives B's fence. Handover back: A's writes run at a newer version than the fence and commit, and workflows last written on B load on A |
+| `NewShardOwnerWithStaleNamespaceCacheFences` | Forced failover; B writes the workflow; B's shard is re-acquired while acks see the pre-failover cache (test hook), and A's shard reloads (fences are in memory). The zombie A must not hand out the workflow task or complete the workflow. Fails without the acquisition-time read |
 | `ForcedFailoverFencesOldActive` | Forced failover with A cut off from the namespace change (zombie). B commits alone. A's new writes, its writes to existing workflows, and its reads of the zombie write are all fenced. A returns: it knows the failover and is drained to B. Two-step rejoin. B waits for A. Failback; everything B acknowledged is on A |
 
 Mutation checks: removing the fencing check fails `ForcedFailoverFencesOldActive`, where the zombie acknowledges a write. Ignoring the record, or reading it only once per wait, fails `DegradedModeAndRejoin`. Unit tests cover:
