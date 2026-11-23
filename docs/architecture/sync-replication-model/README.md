@@ -51,7 +51,6 @@ Run: `python3 model.py --max-writes 3 --max-failovers 2 [--fingerprint] [--mutat
 | 2 writes, 1 failover | OK: 560,248 states, 4.6M transitions |
 | 2 writes, 2 failovers | OK: 4,849,488 states, 39.8M transitions |
 | 3 writes, 1 failover | OK: 4,754,592 states, 39.9M transitions |
-| 3 writes, 2 failovers | see below |
 
 Both TLC and `model.py` agree on every row above.
 
@@ -78,7 +77,7 @@ The models are parameterized (`TermRule`, `ForceDropsOld`, `StrictRejoin` in the
 |---|---|
 | v1, 2 writes, 1 failover | OK, 500,776 states (TLC and `model.py` agree) |
 | v1, 2 writes, 2 failovers | OK, 3,629,408 states (TLC and `model.py` agree) |
-| v1, 3 writes, 2 failovers | see below |
+| v1, 3 writes, 2 failovers | OK, 32,077,812 states, 295M transitions (TLC) |
 | term-rule, 3 writes, 2 failovers | OK, 49,914,332 states, 420M transitions (TLC) |
 | v1 without the stricter rejoin, or without dropping the old active | violation |
 | v1 mutants: `no-fencing`, `one-step-rejoin`, `active-shrinks-first`, `force-to-any`, `handover-without-drain`, `rejoin-without-knowing`, `rejoin-without-drain`, `rejoin-without-processing` | each violated (TLC and `model.py`) |
