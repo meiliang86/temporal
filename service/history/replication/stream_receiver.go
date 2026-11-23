@@ -3,6 +3,7 @@
 package replication
 
 import (
+	"errors"
 	"context"
 	"fmt"
 	"maps"
@@ -114,6 +115,9 @@ func NewClusterShardKey(
 	}
 }
 
+// errSkipAck tells the ack loop that an ack was skipped and should be retried later.
+var errSkipAck = errors.New("ack skipped")
+
 func NewStreamReceiver(
 	processToolBox ProcessToolBox,
 	taskConverter ExecutableTaskConverter,
@@ -154,6 +158,9 @@ func NewStreamReceiver(
 			processToolBox.Config,
 			processToolBox.ClusterMetadata,
 			processToolBox.NamespaceCache,
+			processToolBox.ShardController,
+			clientShardKey.ShardID,
+			processToolBox.TestHooks,
 		),
 	}
 	taskTrackerMap := make(map[enumsspb.TaskPriority]FlowControlSignalProvider)
@@ -256,6 +263,9 @@ func (r *StreamReceiverImpl) sendEventLoop() error {
 	var inclusiveLowWatermark int64
 	ack := func() error {
 		watermark, err := r.ackMessage(r.stream)
+		if errors.Is(err, errSkipAck) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -406,6 +416,15 @@ func (r *StreamReceiverImpl) ackMessage(
 		return 0, NewStreamError("InclusiveLowWaterMark is not set", serviceerror.NewInternal("Invalid inclusive low watermark"))
 	}
 
+	// Built after the watermark above, so it covers the tasks that watermark acknowledges.
+	activeNamespaceFailoverVersions, err := r.fencer.activeNamespaceFailoverVersions()
+	if err != nil {
+		// Without the fencing notice the ack could confirm a write this cluster discarded. Skip it;
+		// the next one retries.
+		r.logger.Warn("stream_receiver skipped an ack: sync replication fencing notice unavailable", tag.Error(err))
+		return 0, errSkipAck
+	}
+
 	var throttleHighNamespaceIDs []string
 	if receiverMode == ReceiverModeTieredStack {
 		throttleHighNamespaceIDs = r.NamespaceThrottler.ThrottledNamespaceIDs(r.clientShardKey.ShardID)
@@ -423,8 +442,7 @@ func (r *StreamReceiverImpl) ackMessage(
 				// messages, so the sender may safely emit lane traffic to it.
 				// Isolation only applies to the tiered stack.
 				SupportsNamespaceIsolation: receiverMode == ReceiverModeTieredStack,
-				// Built after the watermark above, so it covers the tasks that watermark acknowledges.
-				ActiveNamespaceFailoverVersions: r.fencer.activeNamespaceFailoverVersions(),
+				ActiveNamespaceFailoverVersions: activeNamespaceFailoverVersions,
 			},
 		},
 	}); err != nil {

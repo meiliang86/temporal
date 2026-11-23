@@ -2,16 +2,19 @@ package xdc
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	commandpb "go.temporal.io/api/command/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	namespacepb "go.temporal.io/api/namespace/v1"
 	replicationpb "go.temporal.io/api/replication/v1"
 	"go.temporal.io/api/serviceerror"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/server/api/adminservice/v1"
@@ -21,6 +24,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/testing/testhooks"
+	historytasks "go.temporal.io/server/service/history/tasks"
 	"go.temporal.io/server/service/worker/migration"
 	"go.temporal.io/server/tests/testcore"
 )
@@ -144,6 +148,28 @@ func (g *replicationGate) Open() {
 		g.closed = false
 		close(g.open)
 	}
+}
+
+// holdOutboundReplication keeps a cluster from sending the namespace's replication tasks until the
+// returned function is called. A cluster that receives a task under a newer failover version
+// refreshes the namespace from the sender, so a zombie must not receive the new active's tasks.
+func (s *syncReplicationTestSuite) holdOutboundReplication(c *testcore.TestCluster, namespaceID string) (release func()) {
+	released := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(released) }) }
+	s.T().Cleanup(c.InjectHook(
+		s.T(),
+		testhooks.NewHook(testhooks.HistoryReplicationTaskConversionInterceptor, func(
+			_ historytasks.Task,
+			convert func() (*replicationspb.ReplicationTask, error),
+		) (*replicationspb.ReplicationTask, error) {
+			<-released
+			return convert()
+		}),
+		namespace.ID(namespaceID),
+	))
+	s.T().Cleanup(release)
+	return release
 }
 
 // holdNamespaceReplication keeps a cluster from applying the namespace's metadata changes (so it
@@ -430,8 +456,11 @@ func (s *syncReplicationTestSuite) TestFailover_ForcedFailoverFencesOldActive() 
 	s.Require().NoError(err)
 	versionA := s.failoverVersion(ctx, a, ns)
 
-	// Forced failover to B; A doesn't hear about it. The control plane drops A (B commits alone).
+	// Forced failover to B; A doesn't hear about it, neither through namespace replication nor from
+	// B's replication tasks. The control plane drops A (B commits alone).
+	namespaceID := s.describeNamespace(s.T(), a, ns, true).GetNamespaceInfo().GetId()
 	releaseA := s.holdNamespaceReplication(a, ns)
+	releaseB := s.holdOutboundReplication(b, namespaceID)
 	_, err = b.FrontendClient().UpdateNamespace(ctx, &workflowservice.UpdateNamespaceRequest{
 		Namespace:         ns,
 		ReplicationConfig: &replicationpb.NamespaceReplicationConfig{ActiveClusterName: b.ClusterName()},
@@ -452,6 +481,7 @@ func (s *syncReplicationTestSuite) TestFailover_ForcedFailoverFencesOldActive() 
 	s.EventuallyWithT(func(t *assert.CollectT) {
 		require.Equal(t, versionB, s.peerStatus(ctx, t, a, ns, b).GetFencedAtFailoverVersion())
 	}, replicationWaitTime, replicationCheckInterval)
+	s.Equal(a.ClusterName(), s.describeNamespace(s.T(), a, ns, true).GetReplicationConfig().GetActiveClusterName())
 	_, err = s.startWorkflowOn(ctx, a, ns, "zombie-write")
 	var notActive *serviceerror.NamespaceNotActive
 	s.Require().ErrorAs(err, &notActive)
@@ -473,6 +503,7 @@ func (s *syncReplicationTestSuite) TestFailover_ForcedFailoverFencesOldActive() 
 	// A returns: it learns of the failover. The control plane checks it before letting it rejoin:
 	// A knows the current failover, and A's writes (including the zombie one) are drained to B.
 	releaseA()
+	releaseB()
 	s.EventuallyWithT(func(t *assert.CollectT) {
 		status := s.syncStatus(ctx, t, a, ns)
 		require.Equal(t, b.ClusterName(), status.GetActiveCluster())
@@ -511,4 +542,112 @@ func (s *syncReplicationTestSuite) TestFailover_ForcedFailoverFencesOldActive() 
 	// The records survived the failovers' namespace replication.
 	s.Equal(int64(4), s.syncStatus(ctx, s.T(), a, ns).GetState().GetVersion())
 	s.Equal(int64(4), s.syncStatus(ctx, s.T(), b, ns).GetState().GetVersion())
+}
+
+// A shard of the new active moves to a history host whose namespace cache hasn't seen the forced
+// failover yet. The new active had already written the workflow under the new version, so that host
+// ignores the zombie old active's write to it as a stale branch. Its ack must still fence the old
+// active: otherwise the old active acknowledges a write the in-sync cluster doesn't have.
+//
+// The onebox runs one history host per cluster, so the move is played by closing the shard (it is
+// re-acquired) while the SyncReplicationStaleNamespaceView hook gives the acks the pre-failover view
+// of the namespace cache. The old active's shard is closed too: fencing notices are kept in memory,
+// and a reloaded shard must get them again from the new active.
+func (s *syncReplicationTestSuite) TestFailover_NewShardOwnerWithStaleNamespaceCacheFences() {
+	s.requireTwoClusters()
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	ns := s.createNamespace(true, s.clusters)
+	a, b := s.clusters[0], s.clusters[1]
+	namespaceID := s.describeNamespace(s.T(), a, ns, true).GetNamespaceInfo().GetId()
+	s.pushRecord(ctx, ns, &persistencespb.NamespaceSyncReplication{Version: 1, InSyncClusters: []string{a.ClusterName(), b.ClusterName()}}, a, b)
+	a.OverrideDynamicConfig(s.T(), dynamicconfig.SyncReplicationCommitTimeout, 10*time.Second)
+
+	const workflowID = "stale-cache"
+	runID, err := s.startWorkflowOn(ctx, a, ns, workflowID)
+	s.Require().NoError(err)
+
+	// Forced failover to B. A doesn't hear about it, nor receive B's writes.
+	releaseNamespace := s.holdNamespaceReplication(a, ns)
+	releaseOutbound := s.holdOutboundReplication(b, namespaceID)
+	// Leave the clusters converged for the next test: A learns of the failover before it receives
+	// B's tasks (as a zombie it would refuse to apply them, stalling its acks for every namespace).
+	defer func() {
+		releaseNamespace()
+		s.EventuallyWithT(func(t *assert.CollectT) {
+			require.Equal(t, b.ClusterName(), s.describeNamespace(t, a, ns, true).GetReplicationConfig().GetActiveClusterName())
+		}, replicationWaitTime, replicationCheckInterval)
+		s.waitForNamespaceCacheRefresh()
+		releaseOutbound()
+		s.EventuallyWithT(func(t *assert.CollectT) {
+			require.True(t, s.peerStatus(ctx, t, b, ns, a).GetDrained())
+		}, replicationWaitTime, replicationCheckInterval)
+	}()
+	_, err = b.FrontendClient().UpdateNamespace(ctx, &workflowservice.UpdateNamespaceRequest{
+		Namespace:         ns,
+		ReplicationConfig: &replicationpb.NamespaceReplicationConfig{ActiveClusterName: b.ClusterName()},
+	})
+	s.Require().NoError(err)
+	s.pushRecord(ctx, ns, &persistencespb.NamespaceSyncReplication{Version: 2, InSyncClusters: []string{b.ClusterName()}}, b)
+	s.waitForNamespaceCacheRefresh()
+	versionB := s.failoverVersion(ctx, b, ns)
+
+	// B writes the workflow under the new failover version.
+	_, err = b.FrontendClient().SignalWorkflowExecution(ctx, &workflowservice.SignalWorkflowExecutionRequest{
+		Namespace:         ns,
+		WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: workflowID, RunId: runID},
+		SignalName:        "on-b",
+		RequestId:         "signal-on-b",
+	})
+	s.Require().NoError(err)
+
+	// The workflow's shard on B moves to a host with a stale namespace cache; A's shard reloads.
+	s.T().Cleanup(b.InjectHook(s.T(), testhooks.NewHook(testhooks.SyncReplicationStaleNamespaceView, true), namespace.ID(namespaceID)))
+	// (A refuses to load the workflow already: it has B's fencing notice, in memory. Both clusters
+	// have the same number of shards, so B's shard ID is A's too.)
+	resp, err := b.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+		Namespace: ns,
+		Execution: &commonpb.WorkflowExecution{WorkflowId: workflowID, RunId: runID},
+	})
+	s.Require().NoError(err)
+	shardID, err := strconv.ParseInt(resp.GetShardId(), 10, 32)
+	s.Require().NoError(err)
+	for _, c := range []*testcore.TestCluster{b, a} {
+		_, err = c.AdminClient().CloseShard(ctx, &adminservice.CloseShardRequest{ShardId: int32(shardID)})
+		s.Require().NoError(err)
+	}
+
+	s.Equal(a.ClusterName(), s.describeNamespace(s.T(), a, ns, true).GetReplicationConfig().GetActiveClusterName())
+
+	// The zombie A hands out the workflow task and completes the workflow, under its old version.
+	// B ignores both as a stale branch. A must not acknowledge either.
+	pollCtx, pollCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer pollCancel()
+	pollResp, err := a.FrontendClient().PollWorkflowTaskQueue(pollCtx, &workflowservice.PollWorkflowTaskQueueRequest{
+		Namespace: ns,
+		TaskQueue: &taskqueuepb.TaskQueue{Name: "sync-repl-tq-" + workflowID, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		Identity:  "zombie-worker",
+	})
+	if err != nil || len(pollResp.GetTaskToken()) == 0 {
+		// Not acknowledged. Check it is because B fenced A, not for some other reason: A's reloaded
+		// shard has B's fencing notice for the new version.
+		s.EventuallyWithT(func(t *assert.CollectT) {
+			require.Equal(t, versionB, s.peerStatus(ctx, t, a, ns, b).GetFencedAtFailoverVersion())
+		}, replicationWaitTime, replicationCheckInterval)
+		return
+	}
+	_, err = a.FrontendClient().RespondWorkflowTaskCompleted(ctx, &workflowservice.RespondWorkflowTaskCompletedRequest{
+		Namespace: ns,
+		TaskToken: pollResp.GetTaskToken(),
+		Identity:  "zombie-worker",
+		Commands: []*commandpb.Command{{
+			CommandType: enumspb.COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION,
+			Attributes: &commandpb.Command_CompleteWorkflowExecutionCommandAttributes{
+				CompleteWorkflowExecutionCommandAttributes: &commandpb.CompleteWorkflowExecutionCommandAttributes{},
+			},
+		}},
+	})
+	s.Failf("old active acknowledged a write the in-sync cluster doesn't have",
+		"A handed out the workflow task (started event %d) and completing the workflow returned %v; on B the workflow is %v",
+		pollResp.GetStartedEventId(), err, s.standbyStatus(ctx, b, ns, workflowID, runID))
 }

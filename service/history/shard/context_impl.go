@@ -485,6 +485,9 @@ func (s *ContextImpl) UpdateRemoteReaderFencing(
 	defer s.wUnlock()
 
 	remoteClusterInfo := s.getOrUpdateRemoteClusterInfoLocked(clusterName)
+	if remoteClusterInfo.FencedNamespaceFailoverVersions == nil {
+		remoteClusterInfo.FencedNamespaceFailoverVersions = make(map[int32]map[string]int64)
+	}
 	fences, ok := remoteClusterInfo.FencedNamespaceFailoverVersions[shardID]
 	if !ok {
 		fences = make(map[string]int64, len(activeNamespaceFailoverVersions))
@@ -2219,9 +2222,10 @@ func (s *ContextImpl) loadShardMetadata(ownershipChanged *bool) error {
 
 		if clusterName != currentClusterName {
 			remoteClusterInfos[clusterName] = &remoteClusterInfo{
-				CurrentTime:                exclusiveMaxReadTime,
-				AckedReplicationTaskIDs:    make(map[int32]int64),
-				AckedReplicationTimestamps: make(map[int32]time.Time),
+				CurrentTime:                     exclusiveMaxReadTime,
+				AckedReplicationTaskIDs:         make(map[int32]int64),
+				AckedReplicationTimestamps:      make(map[int32]time.Time),
+				FencedNamespaceFailoverVersions: make(map[int32]map[string]int64),
 			}
 		}
 	}

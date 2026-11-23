@@ -46,6 +46,10 @@ var (
 	// test stack for one namespace. Production builds always report it as unset.
 	HistoryPassiveReplicationTest       = newKey[HistoryPassiveReplicationTestHook, namespace.ID]()
 	HistoryDLQTaskDeleteInterceptor     = newKey[func(context.Context, *historyservice.DeleteDLQTasksRequest, func(context.Context, *historyservice.DeleteDLQTasksRequest) (*historyservice.DeleteDLQTasksResponse, error)) (*historyservice.DeleteDLQTasksResponse, error), global]()
+	// SyncReplicationStaleNamespaceView makes the replication acks of a cluster use a namespace view
+	// that hasn't seen the latest failover, as on a history host whose namespace cache hasn't
+	// refreshed yet. Only the cached view is affected; reads from the database are not.
+	SyncReplicationStaleNamespaceView   = newKey[bool, namespace.ID]()
 	NamespaceReplicationTaskInterceptor = newKey[func(context.Context, *replicationspb.NamespaceTaskAttributes, func() error) error, namespace.Name]()
 	// NamespaceReplicationBeforeLocalCommit injects a test failure after the
 	// metadata write succeeds but before the CHASM component commit begins.

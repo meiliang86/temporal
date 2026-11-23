@@ -924,6 +924,17 @@ func (s *contextSuite) TestWaitForReplicationCommit_Fencing() {
 	s.NoError(err)
 	s.Equal(map[string]int64{namespaceID: 32, "other-ns": 50}, status[cluster.TestAlternativeClusterName].GetFencedNamespaceFailoverVersions())
 
+	// A reloaded shard rebuilds its remote cluster state from the shard info; a notice arriving then
+	// is recorded too.
+	s.mockShard.remoteClusterInfos[cluster.TestAlternativeClusterName] = &remoteClusterInfo{
+		AckedReplicationTaskIDs:    map[int32]int64{s.mockShard.shardID: 100},
+		AckedReplicationTimestamps: map[int32]time.Time{},
+	}
+	s.NoError(s.mockShard.UpdateRemoteReaderFencing(readerID, map[string]int64{namespaceID: 32}))
+	fencedBy, err = s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 20, 100, clusters)
+	s.NoError(err)
+	s.Equal(cluster.TestAlternativeClusterName, fencedBy)
+
 	// Unknown clusters are rejected.
 	s.Error(s.mockShard.UpdateRemoteReaderFencing(ReplicationReaderIDFromClusterShardID(12345, 1), map[string]int64{namespaceID: 1}))
 }
