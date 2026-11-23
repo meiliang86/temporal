@@ -39,8 +39,8 @@ Agreed scope for the first implementation. Later sections describe the full desi
 - **One ack watermark (no durable-watermark work).** v1 counts the existing progress watermark as the commit ack. A task that goes to the replication DLQ still advances it, so a write can be treated as committed while that standby is missing it. If the standby is then promoted, that write is lost.
   - **Mitigation:** any replication DLQ entry for a sync namespace is a page-level alert. The DLQ'd workflows are re-replicated before that standby is eligible for a clean promote.
   - The proper fix is logged as future work (§10).
-- **The control plane is push-only.** It calls the data plane: existing failover APIs, `UpdateSyncReplicationState` for the in-sync set and lease renewals, and `GetSyncReplicationStatus` for health, lag and drain state. The data plane never calls the control plane.
-- **Failure detection is external.** The failure detector and the control plane make all membership and failover decisions, including human overrides, through the control plane's serialized record (§5.3–5.4). The data plane keeps only local safety reflexes: stop when the lease expires, demote when fenced, return `Unavailable` on a quorum-wait timeout.
+- **The control plane is push-only.** It calls the data plane: existing failover APIs, `UpdateSyncReplicationState` for the in-sync set, and `GetSyncReplicationStatus` for health, lag and drain state. The data plane never calls the control plane.
+- **Failure detection is external.** The failure detector and the control plane make all membership and failover decisions, including human overrides, through the control plane's serialized record (§5.3–5.4). The data plane keeps only local safety reflexes: demote when fenced, return `Unavailable` on a quorum-wait timeout.
 
 ## v1 failover (two clusters)
 
@@ -52,9 +52,9 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 - **The only new per-namespace state is the in-sync set**, pushed by the control plane and stored as a local, never-replicated field of the namespace metadata:
   - `in_sync_clusters`,
   - `required_acks` (1 for two clusters; also 1 for three-cluster majority later),
-  - `lease_expiry` (used only when the in-sync set is the active cluster alone),
   - `version` (stale or duplicate pushes are ignored).
-- **Commit rule:** a write commits when `required_acks` members of the in-sync set other than the active have acknowledged it. With in-sync = {active} (degraded), it commits locally, but only while the lease is valid. After expiry, writes stay hidden and callers get `Unavailable`.
+- **Commit rule:** a write commits when `required_acks` members of the in-sync set other than the active have acknowledged it. With in-sync = {active} (degraded), it commits locally.
+- **Failover only to an in-sync cluster.** Automatic failover (planned or forced) targets only a member of the in-sync set. A double failure (the standby was dropped, then the active fails) leaves the namespace unavailable until the active returns. The plain forced failover remains a manual escape hatch: an operator guarantees the old active is down and accepts losing its degraded-period writes. No lease is needed, because a degraded active is never replaced automatically.
 - **Fencing notice:** once a cluster is active for namespace N at failover version v, every replication ack it sends to another cluster carries "N is at v". That cluster then stops counting those acks for N, fails pending commits immediately, and rejects new writes with `NamespaceNotActive` naming the new active. The notice travels in the same message as the watermark it covers.
 
 ### Flows
@@ -62,19 +62,17 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 | Flow | How | New pieces |
 |---|---|---|
 | Planned failover | Existing handover workflow, unchanged | None expected (needs a test) |
-| Standby fails | Control plane pushes in-sync = {A} plus a lease; A commits alone while the lease is renewed | Degraded mode, lease |
-| Forced failover (A down or partitioned) | `UpdateNamespace(active = B)` on B, then in-sync = {B} plus a lease | Fencing notice |
+| Standby fails | Control plane pushes in-sync = {A}; A commits alone | Degraded mode |
+| Forced failover (A down or partitioned, B in sync) | `UpdateNamespace(active = B)` on B, then in-sync = {B} | Fencing notice |
 | Old active returns | A stops writing (fenced); A → B drains to A's fixed end; B → A catches up; two-step rejoin | `drained_to` / `caught_up` status |
 | Failback | Planned failover once A is in sync | None |
-| Forced failover while degraded | Human override after A's lease has expired; degraded-period writes are lost | Lease |
-
-**Why the lease:** in normal mode A can't commit without B, so fencing alone stops a zombie A. While degraded, A commits alone. The lease guarantees that A, if cut off from the control plane, stops acknowledging writes by a known time, and the control plane promotes B only after that time. Cost: a control-plane outage longer than the lease stops writes on a degraded namespace.
+| Active fails while degraded | Not supported automatically: the namespace waits for A. Manual escape hatch: forced failover by an operator who guarantees A is down, accepting loss of degraded-period writes | None |
 
 **Uncommitted writes of the old active:** kept. They apply on B when A's queue drains, and conflict resolution and event reapply handle workflows B already wrote, as today. "A is in sync again" means both directions are drained (A → B to A's fixed end, B → A caught up) and the rejoin step is complete. The alternative, discarding them, needs corrective tasks from B, a rollback mode in snapshot apply, and reapply off. It is deferred.
 
 ### API
 
-- **`UpdateSyncReplicationState`** (admin, new): sets the in-sync set, `required_acks` and lease for one or more namespaces. A lease renewal is the same version with a later expiry.
+- **`UpdateSyncReplicationState`** (admin, new): sets the in-sync set and `required_acks` for one or more namespaces.
 - **`GetSyncReplicationStatus`** (admin, new), per namespace:
   - stored state, and the lowest version applied across shards;
   - role (active, standby, fenced);
@@ -99,7 +97,7 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 1. Test planned failover on a sync namespace.
 2. Fencing notice and its handling; test a forced failover with A partitioned.
 3. In-sync state storage and the two admin RPCs (proto changes).
-4. Commit by in-sync set; degraded mode with the lease.
+4. Commit by in-sync set; degraded mode.
 5. Rejoin status (`caught_up`, `drained_to`); full A → B → A test.
 
 ## 1. How replication works today, mapped to Raft
