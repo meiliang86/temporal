@@ -3815,3 +3815,151 @@ func (this *CountExecutionsResponse) Equal(that interface{}) bool {
 
 	return proto.Equal(this, that1)
 }
+
+// Marshal an object of type UpdateSyncReplicationStateRequest to the protobuf v3 wire format
+func (val *UpdateSyncReplicationStateRequest) Marshal() ([]byte, error) {
+	return proto.Marshal(val)
+}
+
+// Unmarshal an object of type UpdateSyncReplicationStateRequest from the protobuf v3 wire format
+func (val *UpdateSyncReplicationStateRequest) Unmarshal(buf []byte) error {
+	return proto.Unmarshal(buf, val)
+}
+
+// Size returns the size of the object, in bytes, once serialized
+func (val *UpdateSyncReplicationStateRequest) Size() int {
+	return proto.Size(val)
+}
+
+// Equal returns whether two UpdateSyncReplicationStateRequest values are equivalent by recursively
+// comparing the message's fields.
+// For more information see the documentation for
+// https://pkg.go.dev/google.golang.org/protobuf/proto#Equal
+func (this *UpdateSyncReplicationStateRequest) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	var that1 *UpdateSyncReplicationStateRequest
+	switch t := that.(type) {
+	case *UpdateSyncReplicationStateRequest:
+		that1 = t
+	case UpdateSyncReplicationStateRequest:
+		that1 = &t
+	default:
+		return false
+	}
+
+	return proto.Equal(this, that1)
+}
+
+// Marshal an object of type UpdateSyncReplicationStateResponse to the protobuf v3 wire format
+func (val *UpdateSyncReplicationStateResponse) Marshal() ([]byte, error) {
+	return proto.Marshal(val)
+}
+
+// Unmarshal an object of type UpdateSyncReplicationStateResponse from the protobuf v3 wire format
+func (val *UpdateSyncReplicationStateResponse) Unmarshal(buf []byte) error {
+	return proto.Unmarshal(buf, val)
+}
+
+// Size returns the size of the object, in bytes, once serialized
+func (val *UpdateSyncReplicationStateResponse) Size() int {
+	return proto.Size(val)
+}
+
+// Equal returns whether two UpdateSyncReplicationStateResponse values are equivalent by recursively
+// comparing the message's fields.
+// For more information see the documentation for
+// https://pkg.go.dev/google.golang.org/protobuf/proto#Equal
+func (this *UpdateSyncReplicationStateResponse) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	var that1 *UpdateSyncReplicationStateResponse
+	switch t := that.(type) {
+	case *UpdateSyncReplicationStateResponse:
+		that1 = t
+	case UpdateSyncReplicationStateResponse:
+		that1 = &t
+	default:
+		return false
+	}
+
+	return proto.Equal(this, that1)
+}
+
+// Marshal an object of type GetSyncReplicationStatusRequest to the protobuf v3 wire format
+func (val *GetSyncReplicationStatusRequest) Marshal() ([]byte, error) {
+	return proto.Marshal(val)
+}
+
+// Unmarshal an object of type GetSyncReplicationStatusRequest from the protobuf v3 wire format
+func (val *GetSyncReplicationStatusRequest) Unmarshal(buf []byte) error {
+	return proto.Unmarshal(buf, val)
+}
+
+// Size returns the size of the object, in bytes, once serialized
+func (val *GetSyncReplicationStatusRequest) Size() int {
+	return proto.Size(val)
+}
+
+// Equal returns whether two GetSyncReplicationStatusRequest values are equivalent by recursively
+// comparing the message's fields.
+// For more information see the documentation for
+// https://pkg.go.dev/google.golang.org/protobuf/proto#Equal
+func (this *GetSyncReplicationStatusRequest) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	var that1 *GetSyncReplicationStatusRequest
+	switch t := that.(type) {
+	case *GetSyncReplicationStatusRequest:
+		that1 = t
+	case GetSyncReplicationStatusRequest:
+		that1 = &t
+	default:
+		return false
+	}
+
+	return proto.Equal(this, that1)
+}
+
+// Marshal an object of type GetSyncReplicationStatusResponse to the protobuf v3 wire format
+func (val *GetSyncReplicationStatusResponse) Marshal() ([]byte, error) {
+	return proto.Marshal(val)
+}
+
+// Unmarshal an object of type GetSyncReplicationStatusResponse from the protobuf v3 wire format
+func (val *GetSyncReplicationStatusResponse) Unmarshal(buf []byte) error {
+	return proto.Unmarshal(buf, val)
+}
+
+// Size returns the size of the object, in bytes, once serialized
+func (val *GetSyncReplicationStatusResponse) Size() int {
+	return proto.Size(val)
+}
+
+// Equal returns whether two GetSyncReplicationStatusResponse values are equivalent by recursively
+// comparing the message's fields.
+// For more information see the documentation for
+// https://pkg.go.dev/google.golang.org/protobuf/proto#Equal
+func (this *GetSyncReplicationStatusResponse) Equal(that interface{}) bool {
+	if that == nil {
+		return this == nil
+	}
+
+	var that1 *GetSyncReplicationStatusResponse
+	switch t := that.(type) {
+	case *GetSyncReplicationStatusResponse:
+		that1 = t
+	case GetSyncReplicationStatusResponse:
+		that1 = &t
+	default:
+		return false
+	}
+
+	return proto.Equal(this, that1)
+}

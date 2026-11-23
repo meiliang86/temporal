@@ -245,6 +245,17 @@ func (s *StreamSenderImpl) sendEventLoop(priority enumsspb.TaskPriority) (retErr
 func (s *StreamSenderImpl) recvSyncReplicationState(
 	attr *replicationspb.SyncReplicationState,
 ) error {
+	// Sync replication fencing: record the notice before the watermark it travels with, so a waiting
+	// write never sees the new watermark without it.
+	if versions := attr.GetActiveNamespaceFailoverVersions(); len(versions) > 0 {
+		readerID := shard.ReplicationReaderIDFromClusterShardID(
+			int64(s.clientShardKey.ClusterID),
+			s.clientShardKey.ShardID,
+		)
+		if err := s.shardContext.UpdateRemoteReaderFencing(readerID, versions); err != nil {
+			return err
+		}
+	}
 	if s.readerGroup != nil {
 		readerState, err := s.readerGroup.BuildReaderState(attr)
 		if err != nil {

@@ -386,6 +386,21 @@ func (c *retryableClient) GetShard(
 	return resp, err
 }
 
+func (c *retryableClient) GetSyncReplicationStatus(
+	ctx context.Context,
+	request *adminservice.GetSyncReplicationStatusRequest,
+	opts ...grpc.CallOption,
+) (*adminservice.GetSyncReplicationStatusResponse, error) {
+	var resp *adminservice.GetSyncReplicationStatusResponse
+	op := func(ctx context.Context) error {
+		var err error
+		resp, err = c.client.GetSyncReplicationStatus(ctx, request, opts...)
+		return err
+	}
+	err := backoff.ThrottleRetryContext(ctx, op, c.policy, c.isRetryable)
+	return resp, err
+}
+
 func (c *retryableClient) GetTaskQueueTasks(
 	ctx context.Context,
 	request *adminservice.GetTaskQueueTasksRequest,
@@ -740,6 +755,21 @@ func (c *retryableClient) SyncWorkflowState(
 	op := func(ctx context.Context) error {
 		var err error
 		resp, err = c.client.SyncWorkflowState(ctx, request, opts...)
+		return err
+	}
+	err := backoff.ThrottleRetryContext(ctx, op, c.policy, c.isRetryable)
+	return resp, err
+}
+
+func (c *retryableClient) UpdateSyncReplicationState(
+	ctx context.Context,
+	request *adminservice.UpdateSyncReplicationStateRequest,
+	opts ...grpc.CallOption,
+) (*adminservice.UpdateSyncReplicationStateResponse, error) {
+	var resp *adminservice.UpdateSyncReplicationStateResponse
+	op := func(ctx context.Context) error {
+		var err error
+		resp, err = c.client.UpdateSyncReplicationState(ctx, request, opts...)
 		return err
 	}
 	err := backoff.ThrottleRetryContext(ctx, op, c.policy, c.isRetryable)

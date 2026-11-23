@@ -64,6 +64,8 @@ type (
 		// ackSignalChan is signaled when tracked tasks complete or the watermark advances, so
 		// the ack loop can acknowledge eagerly (ReplicationStreamEagerSyncStatusInterval).
 		ackSignalChan chan struct{}
+		// fencer builds the fencing notice sent with every ack (sync replication).
+		fencer *syncReplicationFencer
 
 		slowSubmissionMu         sync.RWMutex
 		slowSubmissionTimestamps map[enumsspb.TaskPriority]time.Time
@@ -148,6 +150,11 @@ func NewStreamReceiver(
 		slowSubmissionTimestamps: make(map[enumsspb.TaskPriority]time.Time),
 		recvSignalChan:           make(chan struct{}, 1),
 		ackSignalChan:            make(chan struct{}, 1),
+		fencer: newSyncReplicationFencer(
+			processToolBox.Config,
+			processToolBox.ClusterMetadata,
+			processToolBox.NamespaceCache,
+		),
 	}
 	taskTrackerMap := make(map[enumsspb.TaskPriority]FlowControlSignalProvider)
 	taskTrackerMap[enumsspb.TASK_PRIORITY_HIGH] = func() *FlowControlSignal {
@@ -416,6 +423,8 @@ func (r *StreamReceiverImpl) ackMessage(
 				// messages, so the sender may safely emit lane traffic to it.
 				// Isolation only applies to the tiered stack.
 				SupportsNamespaceIsolation: receiverMode == ReceiverModeTieredStack,
+				// Built after the watermark above, so it covers the tasks that watermark acknowledges.
+				ActiveNamespaceFailoverVersions: r.fencer.activeNamespaceFailoverVersions(),
 			},
 		},
 	}); err != nil {

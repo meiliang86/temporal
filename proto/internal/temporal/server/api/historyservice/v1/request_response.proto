@@ -978,6 +978,8 @@ message GetReplicationStatusRequest {
 
   // Remote cluster names to query for. If omit, will return for all remote clusters.
   repeated string remote_clusters = 1;
+  // Sync replication namespaces (IDs) to report the applied membership record version for.
+  repeated string sync_replication_namespace_ids = 2;
 }
 
 message GetReplicationStatusResponse {
@@ -994,6 +996,15 @@ message ShardReplicationStatus {
   map<string, HandoverNamespaceInfo> handover_namespaces = 5;
 
   google.protobuf.Timestamp max_replication_task_visibility_time = 6;
+  // Highest replication task ID a sync replication write of this shard may wait on. A remote cluster
+  // that acked at least this far has every sync replication write of the shard.
+  int64 sync_replication_barrier = 7;
+  // For each requested sync replication namespace ID, the membership record version this shard's
+  // host currently applies to commits.
+  map<string, int64> sync_replication_applied_versions = 8;
+  // For each requested sync replication namespace ID, the failover version this shard's host
+  // currently sees for the namespace.
+  map<string, int64> namespace_failover_versions = 9;
 }
 
 message HandoverNamespaceInfo {
@@ -1006,6 +1017,8 @@ message ShardReplicationStatusPerCluster {
   int64 acked_task_id = 1;
   // Acked replication task creation time
   google.protobuf.Timestamp acked_task_visibility_time = 2;
+  // Fencing notices received from this cluster: namespace ID -> failover version it is active at.
+  map<string, int64> fenced_namespace_failover_versions = 3;
 }
 
 message RebuildMutableStateRequest {

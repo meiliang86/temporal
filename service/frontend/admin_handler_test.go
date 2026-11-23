@@ -1461,6 +1461,10 @@ func (s *adminHandlerSuite) TestGetNamespace_ReturnsReplicatedFields() {
 			ClusterReplicationRamps: map[string]*persistencespb.NamespaceReplicationRamp{
 				"cluster-b": {StartTime: at, Duration: timestamp.DurationFromDays(1)},
 			},
+			// Source-local: set by the control plane on each cluster, never replicated.
+			SyncReplication: &persistencespb.NamespaceSyncReplication{
+				Version: 3, InSyncClusters: []string{"cluster-a"}, JoiningClusters: []string{"cluster-b"},
+			},
 		},
 		ConfigVersion: 10, FailoverVersion: 20, FailoverNotificationVersion: 30, FailoverEndTime: at,
 	}

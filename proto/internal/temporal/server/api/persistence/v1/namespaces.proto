@@ -59,6 +59,19 @@ message NamespaceReplicationConfig {
   repeated FailoverStatus failover_history = 8;
   // Source-local schedules; namespace replication must not copy this field.
   map<string, NamespaceReplicationRamp> cluster_replication_ramps = 9;
+  // Sync replication membership, set by the control plane through the admin API
+  // UpdateSyncReplicationState. Local to this cluster: namespace replication must not copy it.
+  NamespaceSyncReplication sync_replication = 10;
+}
+
+// Which clusters a sync replication namespace's commits wait for.
+message NamespaceSyncReplication {
+  // Assigned by the control plane; a record is applied only if its version is higher than the stored one.
+  int64 version = 1;
+  // Clusters that have every committed write and may be promoted. Includes the active cluster.
+  repeated string in_sync_clusters = 2;
+  // Clusters commits already wait for, but which are not yet promotable (step 1 of a rejoin).
+  repeated string joining_clusters = 3;
 }
 
 message NamespaceReplicationRamp {

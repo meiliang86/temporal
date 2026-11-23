@@ -24,6 +24,8 @@ const (
 	AdminService_ImportWorkflowExecution_FullMethodName             = "/temporal.server.api.adminservice.v1.AdminService/ImportWorkflowExecution"
 	AdminService_DescribeMutableState_FullMethodName                = "/temporal.server.api.adminservice.v1.AdminService/DescribeMutableState"
 	AdminService_DescribeHistoryHost_FullMethodName                 = "/temporal.server.api.adminservice.v1.AdminService/DescribeHistoryHost"
+	AdminService_UpdateSyncReplicationState_FullMethodName          = "/temporal.server.api.adminservice.v1.AdminService/UpdateSyncReplicationState"
+	AdminService_GetSyncReplicationStatus_FullMethodName            = "/temporal.server.api.adminservice.v1.AdminService/GetSyncReplicationStatus"
 	AdminService_GetShard_FullMethodName                            = "/temporal.server.api.adminservice.v1.AdminService/GetShard"
 	AdminService_CloseShard_FullMethodName                          = "/temporal.server.api.adminservice.v1.AdminService/CloseShard"
 	AdminService_ListHistoryTasks_FullMethodName                    = "/temporal.server.api.adminservice.v1.AdminService/ListHistoryTasks"
@@ -86,6 +88,14 @@ type AdminServiceClient interface {
 	DescribeMutableState(ctx context.Context, in *DescribeMutableStateRequest, opts ...grpc.CallOption) (*DescribeMutableStateResponse, error)
 	// DescribeHistoryHost returns information about the internal states of a history host
 	DescribeHistoryHost(ctx context.Context, in *DescribeHistoryHostRequest, opts ...grpc.CallOption) (*DescribeHistoryHostResponse, error)
+	// UpdateSyncReplicationState sets which clusters commits of sync replication namespaces wait for.
+	// Called by the control plane on every cluster of the namespaces. Idempotent: a record is applied
+	// only if its version is higher than the one stored for the namespace.
+	UpdateSyncReplicationState(ctx context.Context, in *UpdateSyncReplicationStateRequest, opts ...grpc.CallOption) (*UpdateSyncReplicationStateResponse, error)
+	// GetSyncReplicationStatus reports, for one sync replication namespace, what this cluster knows and
+	// how far replication has progressed in each direction. The control plane uses it to decide when a
+	// member may rejoin and when a failover may happen.
+	GetSyncReplicationStatus(ctx context.Context, in *GetSyncReplicationStatusRequest, opts ...grpc.CallOption) (*GetSyncReplicationStatusResponse, error)
 	GetShard(ctx context.Context, in *GetShardRequest, opts ...grpc.CallOption) (*GetShardResponse, error)
 	CloseShard(ctx context.Context, in *CloseShardRequest, opts ...grpc.CallOption) (*CloseShardResponse, error)
 	ListHistoryTasks(ctx context.Context, in *ListHistoryTasksRequest, opts ...grpc.CallOption) (*ListHistoryTasksResponse, error)
@@ -135,7 +145,9 @@ type AdminServiceClient interface {
 	// GetDLQMessages returns messages from DLQ.
 	GetDLQMessages(ctx context.Context, in *GetDLQMessagesRequest, opts ...grpc.CallOption) (*GetDLQMessagesResponse, error)
 	// (-- api-linter: core::0165::response-message-name=disabled
-	//     aip.dev/not-precedent:  --)
+	//
+	//	aip.dev/not-precedent:  --)
+	//
 	// PurgeDLQMessages purges messages from DLQ.
 	PurgeDLQMessages(ctx context.Context, in *PurgeDLQMessagesRequest, opts ...grpc.CallOption) (*PurgeDLQMessagesResponse, error)
 	// MergeDLQMessages merges messages from DLQ.
@@ -159,7 +171,8 @@ type AdminServiceClient interface {
 	GetRemoteClusterNamespace(ctx context.Context, in *GetRemoteClusterNamespaceRequest, opts ...grpc.CallOption) (*GetRemoteClusterNamespaceResponse, error)
 	GetDLQTasks(ctx context.Context, in *GetDLQTasksRequest, opts ...grpc.CallOption) (*GetDLQTasksResponse, error)
 	// (-- api-linter: core::0165::response-message-name=disabled
-	//     aip.dev/not-precedent:  --)
+	//
+	//	aip.dev/not-precedent:  --)
 	PurgeDLQTasks(ctx context.Context, in *PurgeDLQTasksRequest, opts ...grpc.CallOption) (*PurgeDLQTasksResponse, error)
 	MergeDLQTasks(ctx context.Context, in *MergeDLQTasksRequest, opts ...grpc.CallOption) (*MergeDLQTasksResponse, error)
 	DescribeDLQJob(ctx context.Context, in *DescribeDLQJobRequest, opts ...grpc.CallOption) (*DescribeDLQJobResponse, error)
@@ -216,6 +229,24 @@ func (c *adminServiceClient) DescribeMutableState(ctx context.Context, in *Descr
 func (c *adminServiceClient) DescribeHistoryHost(ctx context.Context, in *DescribeHistoryHostRequest, opts ...grpc.CallOption) (*DescribeHistoryHostResponse, error) {
 	out := new(DescribeHistoryHostResponse)
 	err := c.cc.Invoke(ctx, AdminService_DescribeHistoryHost_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) UpdateSyncReplicationState(ctx context.Context, in *UpdateSyncReplicationStateRequest, opts ...grpc.CallOption) (*UpdateSyncReplicationStateResponse, error) {
+	out := new(UpdateSyncReplicationStateResponse)
+	err := c.cc.Invoke(ctx, AdminService_UpdateSyncReplicationState_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) GetSyncReplicationStatus(ctx context.Context, in *GetSyncReplicationStatusRequest, opts ...grpc.CallOption) (*GetSyncReplicationStatusResponse, error) {
+	out := new(GetSyncReplicationStatusResponse)
+	err := c.cc.Invoke(ctx, AdminService_GetSyncReplicationStatus_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -672,6 +703,14 @@ type AdminServiceServer interface {
 	DescribeMutableState(context.Context, *DescribeMutableStateRequest) (*DescribeMutableStateResponse, error)
 	// DescribeHistoryHost returns information about the internal states of a history host
 	DescribeHistoryHost(context.Context, *DescribeHistoryHostRequest) (*DescribeHistoryHostResponse, error)
+	// UpdateSyncReplicationState sets which clusters commits of sync replication namespaces wait for.
+	// Called by the control plane on every cluster of the namespaces. Idempotent: a record is applied
+	// only if its version is higher than the one stored for the namespace.
+	UpdateSyncReplicationState(context.Context, *UpdateSyncReplicationStateRequest) (*UpdateSyncReplicationStateResponse, error)
+	// GetSyncReplicationStatus reports, for one sync replication namespace, what this cluster knows and
+	// how far replication has progressed in each direction. The control plane uses it to decide when a
+	// member may rejoin and when a failover may happen.
+	GetSyncReplicationStatus(context.Context, *GetSyncReplicationStatusRequest) (*GetSyncReplicationStatusResponse, error)
 	GetShard(context.Context, *GetShardRequest) (*GetShardResponse, error)
 	CloseShard(context.Context, *CloseShardRequest) (*CloseShardResponse, error)
 	ListHistoryTasks(context.Context, *ListHistoryTasksRequest) (*ListHistoryTasksResponse, error)
@@ -721,7 +760,9 @@ type AdminServiceServer interface {
 	// GetDLQMessages returns messages from DLQ.
 	GetDLQMessages(context.Context, *GetDLQMessagesRequest) (*GetDLQMessagesResponse, error)
 	// (-- api-linter: core::0165::response-message-name=disabled
-	//     aip.dev/not-precedent:  --)
+	//
+	//	aip.dev/not-precedent:  --)
+	//
 	// PurgeDLQMessages purges messages from DLQ.
 	PurgeDLQMessages(context.Context, *PurgeDLQMessagesRequest) (*PurgeDLQMessagesResponse, error)
 	// MergeDLQMessages merges messages from DLQ.
@@ -745,7 +786,8 @@ type AdminServiceServer interface {
 	GetRemoteClusterNamespace(context.Context, *GetRemoteClusterNamespaceRequest) (*GetRemoteClusterNamespaceResponse, error)
 	GetDLQTasks(context.Context, *GetDLQTasksRequest) (*GetDLQTasksResponse, error)
 	// (-- api-linter: core::0165::response-message-name=disabled
-	//     aip.dev/not-precedent:  --)
+	//
+	//	aip.dev/not-precedent:  --)
 	PurgeDLQTasks(context.Context, *PurgeDLQTasksRequest) (*PurgeDLQTasksResponse, error)
 	MergeDLQTasks(context.Context, *MergeDLQTasksRequest) (*MergeDLQTasksResponse, error)
 	DescribeDLQJob(context.Context, *DescribeDLQJobRequest) (*DescribeDLQJobResponse, error)
@@ -780,6 +822,12 @@ func (UnimplementedAdminServiceServer) DescribeMutableState(context.Context, *De
 }
 func (UnimplementedAdminServiceServer) DescribeHistoryHost(context.Context, *DescribeHistoryHostRequest) (*DescribeHistoryHostResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DescribeHistoryHost not implemented")
+}
+func (UnimplementedAdminServiceServer) UpdateSyncReplicationState(context.Context, *UpdateSyncReplicationStateRequest) (*UpdateSyncReplicationStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateSyncReplicationState not implemented")
+}
+func (UnimplementedAdminServiceServer) GetSyncReplicationStatus(context.Context, *GetSyncReplicationStatusRequest) (*GetSyncReplicationStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSyncReplicationStatus not implemented")
 }
 func (UnimplementedAdminServiceServer) GetShard(context.Context, *GetShardRequest) (*GetShardResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetShard not implemented")
@@ -1000,6 +1048,42 @@ func _AdminService_DescribeHistoryHost_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(AdminServiceServer).DescribeHistoryHost(ctx, req.(*DescribeHistoryHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_UpdateSyncReplicationState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSyncReplicationStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).UpdateSyncReplicationState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_UpdateSyncReplicationState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).UpdateSyncReplicationState(ctx, req.(*UpdateSyncReplicationStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_GetSyncReplicationStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSyncReplicationStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).GetSyncReplicationStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_GetSyncReplicationStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).GetSyncReplicationStatus(ctx, req.(*GetSyncReplicationStatusRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1862,6 +1946,14 @@ var AdminService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DescribeHistoryHost",
 			Handler:    _AdminService_DescribeHistoryHost_Handler,
+		},
+		{
+			MethodName: "UpdateSyncReplicationState",
+			Handler:    _AdminService_UpdateSyncReplicationState_Handler,
+		},
+		{
+			MethodName: "GetSyncReplicationStatus",
+			Handler:    _AdminService_GetSyncReplicationStatus_Handler,
 		},
 		{
 			MethodName: "GetShard",

@@ -566,7 +566,17 @@ func (c *ContextImpl) waitForLoadedStateSyncReplication(
 	if barrier <= 0 {
 		return nil
 	}
-	return waitForSyncReplicationCommit(ctx, shardContext, namespaceEntry, clusters, barrier, c)
+	// Whatever was persisted is checked against the failover version this cluster is active at now:
+	// a peer fenced at a newer version may have discarded some of it.
+	return waitForSyncReplicationCommit(
+		ctx,
+		shardContext,
+		namespaceEntry,
+		c.workflowKey.WorkflowID,
+		namespaceEntry.FailoverVersion(c.workflowKey.WorkflowID),
+		barrier,
+		c,
+	)
 }
 
 func (c *ContextImpl) LoadMutableState(ctx context.Context, shardContext historyi.ShardContext) (historyi.MutableState, error) {

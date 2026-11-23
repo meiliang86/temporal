@@ -245,6 +245,13 @@ func (ns *Namespace) ReplicationConfig() *persistencespb.NamespaceReplicationCon
 	return ns.replicationResolver.ReplicationConfig()
 }
 
+// SyncReplication returns the sync replication membership record the control plane set for this
+// cluster, or nil if none was set. The returned value is the registry's own copy and must not be
+// mutated.
+func (ns *Namespace) SyncReplication() *persistencespb.NamespaceSyncReplication {
+	return ns.ReplicationConfig().GetSyncReplication()
+}
+
 // NotificationVersion return the global notification version of when namespace changed
 func (ns *Namespace) NotificationVersion() int64 {
 	return ns.notificationVersion

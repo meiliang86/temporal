@@ -31,6 +31,20 @@ service AdminService {
     option (temporal.server.api.common.v1.api_category).category = API_CATEGORY_SYSTEM;
   }
 
+  // UpdateSyncReplicationState sets which clusters commits of sync replication namespaces wait for.
+  // Called by the control plane on every cluster of the namespaces. Idempotent: a record is applied
+  // only if its version is higher than the one stored for the namespace.
+  rpc UpdateSyncReplicationState(UpdateSyncReplicationStateRequest) returns (UpdateSyncReplicationStateResponse) {
+    option (temporal.server.api.common.v1.api_category).category = API_CATEGORY_SYSTEM;
+  }
+
+  // GetSyncReplicationStatus reports, for one sync replication namespace, what this cluster knows and
+  // how far replication has progressed in each direction. The control plane uses it to decide when a
+  // member may rejoin and when a failover may happen.
+  rpc GetSyncReplicationStatus(GetSyncReplicationStatusRequest) returns (GetSyncReplicationStatusResponse) {
+    option (temporal.server.api.common.v1.api_category).category = API_CATEGORY_SYSTEM;
+  }
+
   rpc GetShard(GetShardRequest) returns (GetShardResponse) {
     option (temporal.server.api.common.v1.api_category).category = API_CATEGORY_SYSTEM;
   }

@@ -543,6 +543,26 @@ func (mr *MockAdminServiceClientMockRecorder) GetShard(ctx, in any, opts ...any)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetShard", reflect.TypeOf((*MockAdminServiceClient)(nil).GetShard), varargs...)
 }
 
+// GetSyncReplicationStatus mocks base method.
+func (m *MockAdminServiceClient) GetSyncReplicationStatus(ctx context.Context, in *adminservice.GetSyncReplicationStatusRequest, opts ...grpc.CallOption) (*adminservice.GetSyncReplicationStatusResponse, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{ctx, in}
+	for _, a := range opts {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetSyncReplicationStatus", varargs...)
+	ret0, _ := ret[0].(*adminservice.GetSyncReplicationStatusResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetSyncReplicationStatus indicates an expected call of GetSyncReplicationStatus.
+func (mr *MockAdminServiceClientMockRecorder) GetSyncReplicationStatus(ctx, in any, opts ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{ctx, in}, opts...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSyncReplicationStatus", reflect.TypeOf((*MockAdminServiceClient)(nil).GetSyncReplicationStatus), varargs...)
+}
+
 // GetTaskQueueTasks mocks base method.
 func (m *MockAdminServiceClient) GetTaskQueueTasks(ctx context.Context, in *adminservice.GetTaskQueueTasksRequest, opts ...grpc.CallOption) (*adminservice.GetTaskQueueTasksResponse, error) {
 	m.ctrl.T.Helper()
@@ -1041,6 +1061,26 @@ func (mr *MockAdminServiceClientMockRecorder) SyncWorkflowState(ctx, in any, opt
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{ctx, in}, opts...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncWorkflowState", reflect.TypeOf((*MockAdminServiceClient)(nil).SyncWorkflowState), varargs...)
+}
+
+// UpdateSyncReplicationState mocks base method.
+func (m *MockAdminServiceClient) UpdateSyncReplicationState(ctx context.Context, in *adminservice.UpdateSyncReplicationStateRequest, opts ...grpc.CallOption) (*adminservice.UpdateSyncReplicationStateResponse, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{ctx, in}
+	for _, a := range opts {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "UpdateSyncReplicationState", varargs...)
+	ret0, _ := ret[0].(*adminservice.UpdateSyncReplicationStateResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// UpdateSyncReplicationState indicates an expected call of UpdateSyncReplicationState.
+func (mr *MockAdminServiceClientMockRecorder) UpdateSyncReplicationState(ctx, in any, opts ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{ctx, in}, opts...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateSyncReplicationState", reflect.TypeOf((*MockAdminServiceClient)(nil).UpdateSyncReplicationState), varargs...)
 }
 
 // MockAdminService_StreamWorkflowReplicationMessagesClient is a mock of AdminService_StreamWorkflowReplicationMessagesClient interface.
@@ -1580,6 +1620,21 @@ func (mr *MockAdminServiceServerMockRecorder) GetShard(arg0, arg1 any) *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetShard", reflect.TypeOf((*MockAdminServiceServer)(nil).GetShard), arg0, arg1)
 }
 
+// GetSyncReplicationStatus mocks base method.
+func (m *MockAdminServiceServer) GetSyncReplicationStatus(arg0 context.Context, arg1 *adminservice.GetSyncReplicationStatusRequest) (*adminservice.GetSyncReplicationStatusResponse, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetSyncReplicationStatus", arg0, arg1)
+	ret0, _ := ret[0].(*adminservice.GetSyncReplicationStatusResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetSyncReplicationStatus indicates an expected call of GetSyncReplicationStatus.
+func (mr *MockAdminServiceServerMockRecorder) GetSyncReplicationStatus(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSyncReplicationStatus", reflect.TypeOf((*MockAdminServiceServer)(nil).GetSyncReplicationStatus), arg0, arg1)
+}
+
 // GetTaskQueueTasks mocks base method.
 func (m *MockAdminServiceServer) GetTaskQueueTasks(arg0 context.Context, arg1 *adminservice.GetTaskQueueTasksRequest) (*adminservice.GetTaskQueueTasksResponse, error) {
 	m.ctrl.T.Helper()
@@ -1952,6 +2007,21 @@ func (m *MockAdminServiceServer) SyncWorkflowState(arg0 context.Context, arg1 *a
 func (mr *MockAdminServiceServerMockRecorder) SyncWorkflowState(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncWorkflowState", reflect.TypeOf((*MockAdminServiceServer)(nil).SyncWorkflowState), arg0, arg1)
+}
+
+// UpdateSyncReplicationState mocks base method.
+func (m *MockAdminServiceServer) UpdateSyncReplicationState(arg0 context.Context, arg1 *adminservice.UpdateSyncReplicationStateRequest) (*adminservice.UpdateSyncReplicationStateResponse, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateSyncReplicationState", arg0, arg1)
+	ret0, _ := ret[0].(*adminservice.UpdateSyncReplicationStateResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// UpdateSyncReplicationState indicates an expected call of UpdateSyncReplicationState.
+func (mr *MockAdminServiceServerMockRecorder) UpdateSyncReplicationState(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateSyncReplicationState", reflect.TypeOf((*MockAdminServiceServer)(nil).UpdateSyncReplicationState), arg0, arg1)
 }
 
 // mustEmbedUnimplementedAdminServiceServer mocks base method.

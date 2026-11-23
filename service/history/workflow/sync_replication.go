@@ -2,11 +2,15 @@ package workflow
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence/versionhistory"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/tasks"
 )
@@ -71,26 +75,51 @@ func withSyncReplicationLockHandoff(ctx context.Context, handoff syncReplication
 	return context.WithValue(ctx, syncReplicationLockHandoffKey{}, handoff)
 }
 
+// isSyncReplicationNamespace reports whether the namespace uses sync replication: it enables it and
+// is replicated to more than one cluster.
+func isSyncReplicationNamespace(shardContext historyi.ShardContext, namespaceEntry *namespace.Namespace) bool {
+	return namespaceEntry != nil &&
+		namespaceEntry.ReplicationPolicy() == namespace.ReplicationPolicyMultiCluster &&
+		shardContext.GetConfig().SyncReplicationEnabled(namespaceEntry.Name().String())
+}
+
 // SyncReplicationClusters returns the remote clusters that must acknowledge a transaction of the given
 // workflow before it takes effect, or nil if sync replication doesn't apply: the namespace doesn't
-// enable it, isn't replicated, or the workflow isn't active in this cluster.
+// enable it, isn't replicated, the workflow isn't active in this cluster, or the control plane put the
+// namespace in degraded mode (no other member).
 func SyncReplicationClusters(
 	shardContext historyi.ShardContext,
 	namespaceEntry *namespace.Namespace,
 	workflowID string,
 ) []string {
-	if namespaceEntry == nil ||
-		namespaceEntry.ReplicationPolicy() != namespace.ReplicationPolicyMultiCluster ||
-		!shardContext.GetConfig().SyncReplicationEnabled(namespaceEntry.Name().String()) {
+	if !isSyncReplicationNamespace(shardContext, namespaceEntry) {
 		return nil
 	}
 	currentCluster := shardContext.GetClusterMetadata().GetCurrentClusterName()
 	if namespaceEntry.ActiveClusterName(namespace.RoutingKey{ID: workflowID}) != currentCluster {
 		return nil
 	}
+	return syncReplicationCommitClusters(currentCluster, namespaceEntry, workflowID)
+}
+
+// syncReplicationCommitClusters returns the clusters other than currentCluster that a commit waits
+// for. With a membership record from the control plane, those are its in-sync and joining clusters;
+// none means degraded mode, where the active cluster commits alone. Without a record, every cluster
+// of the namespace.
+func syncReplicationCommitClusters(
+	currentCluster string,
+	namespaceEntry *namespace.Namespace,
+	workflowID string,
+) []string {
+	var members []string
+	if record := namespaceEntry.SyncReplication(); record != nil {
+		members = append(slices.Clone(record.GetInSyncClusters()), record.GetJoiningClusters()...)
+	} else {
+		members = namespaceEntry.ClusterNames(workflowID)
+	}
 	var remoteClusters []string
-	for _, cluster := range namespaceEntry.ClusterNames(workflowID) {
-		if cluster != currentCluster {
+	for _, cluster := range members {
+		if cluster != currentCluster && !slices.Contains(remoteClusters, cluster) {
 			remoteClusters = append(remoteClusters, cluster)
 		}
 	}
@@ -109,9 +138,34 @@ func maxReplicationTaskID(taskMaps ...map[tasks.Category][]tasks.Task) int64 {
 	return maxID
 }
 
+// lastWriteFailoverVersion returns the failover version of the last write recorded in a persisted
+// workflow snapshot.
+func lastWriteFailoverVersion(executionInfo *persistencespb.WorkflowExecutionInfo) int64 {
+	if transitions := executionInfo.GetTransitionHistory(); len(transitions) > 0 {
+		return transitions[len(transitions)-1].GetNamespaceFailoverVersion()
+	}
+	if executionInfo.GetVersionHistories() == nil {
+		return common.EmptyVersion
+	}
+	currentHistory, err := versionhistory.GetCurrentVersionHistory(executionInfo.GetVersionHistories())
+	if err != nil {
+		return common.EmptyVersion
+	}
+	lastItem, err := versionhistory.GetLastVersionHistoryItem(currentHistory)
+	if err != nil {
+		return common.EmptyVersion
+	}
+	return lastItem.GetVersion()
+}
+
 // waitForSyncReplication blocks, after a transaction of the given workflow is persisted, until the
 // remote clusters have acknowledged its replication tasks (barrier = the largest of their IDs). If ctx
 // carries a lock handoff, the workflow lock is handed to replication readers while waiting.
+//
+// failoverVersion is the namespace failover version the transaction was made under. Whether to wait
+// is decided by it, not by what the namespace registry says now: a transaction made while this
+// cluster was active must not take effect unacknowledged just because this host has since learned of
+// a failover. Transactions made under another cluster's version apply replication and don't wait.
 //
 // Callers notify the queues about the transaction's tasks only after this returns, so tasks and long
 // polls don't see an unacknowledged transaction. The replication stream sender is the exception: it
@@ -121,6 +175,7 @@ func waitForSyncReplication(
 	shardContext historyi.ShardContext,
 	namespaceID string,
 	workflowID string,
+	failoverVersion int64,
 	taskMaps ...map[tasks.Category][]tasks.Task,
 ) error {
 	barrier := maxReplicationTaskID(taskMaps...)
@@ -134,10 +189,17 @@ func waitForSyncReplication(
 		// being deleted).
 		return nil
 	}
-	clusters := SyncReplicationClusters(shardContext, namespaceEntry, workflowID)
-	if len(clusters) == 0 {
+	if !isSyncReplicationNamespace(shardContext, namespaceEntry) {
 		return nil
 	}
+	clusterMetadata := shardContext.GetClusterMetadata()
+	currentCluster := clusterMetadata.GetCurrentClusterName()
+	if clusterMetadata.ClusterNameForFailoverVersion(namespaceEntry.IsGlobalNamespace(), failoverVersion) != currentCluster {
+		return nil
+	}
+	// Recorded even when nothing is waited for (degraded mode): the control plane checks that every
+	// write up to the barrier reached a peer before letting it rejoin or fail over.
+	shardContext.RecordSyncReplicationBarrier(barrier)
 	engine, err := shardContext.GetEngine(ctx)
 	if err != nil {
 		return err
@@ -146,24 +208,39 @@ func waitForSyncReplication(
 	for _, taskMap := range taskMaps {
 		replicationTasks = append(replicationTasks, taskMap[tasks.CategoryReplication]...)
 	}
-	shardContext.RecordSyncReplicationBarrier(barrier)
 	engine.NotifyNewTasks(map[tasks.Category][]tasks.Task{tasks.CategoryReplication: replicationTasks})
 
 	var handoff syncReplicationLockHandoff
 	if h, ok := ctx.Value(syncReplicationLockHandoffKey{}).(syncReplicationLockHandoff); ok {
 		handoff = h
 	}
-	return waitForSyncReplicationCommit(ctx, shardContext, namespaceEntry, clusters, barrier, handoff)
+	return waitForSyncReplicationCommit(ctx, shardContext, namespaceEntry, workflowID, failoverVersion, barrier, handoff)
 }
 
+// waitForSyncReplicationCommit waits until the clusters a commit needs (re-read from the namespace
+// registry while waiting) have acknowledged every replication task up to barrier, for a write of the
+// workflow made under failoverVersion.
 func waitForSyncReplicationCommit(
 	ctx context.Context,
 	shardContext historyi.ShardContext,
 	namespaceEntry *namespace.Namespace,
-	clusters []string,
+	workflowID string,
+	failoverVersion int64,
 	barrier int64,
 	handoff syncReplicationLockHandoff,
 ) error {
+	currentCluster := shardContext.GetClusterMetadata().GetCurrentClusterName()
+	namespaceID := namespaceEntry.ID()
+	commitClusters := func() []string {
+		if latest, err := shardContext.GetNamespaceRegistry().GetNamespaceByID(namespaceID); err == nil {
+			namespaceEntry = latest
+		}
+		return syncReplicationCommitClusters(currentCluster, namespaceEntry, workflowID)
+	}
+	if len(commitClusters()) == 0 {
+		return nil // degraded mode: this cluster commits alone
+	}
+
 	nsName := namespaceEntry.Name().String()
 	waitCtx, cancel := context.WithTimeout(ctx, shardContext.GetConfig().SyncReplicationCommitTimeout(nsName))
 	defer cancel()
@@ -174,13 +251,19 @@ func waitForSyncReplicationCommit(
 	}
 
 	start := time.Now()
-	err := shardContext.WaitForReplicationCommit(waitCtx, clusters, barrier)
+	fencedBy, err := shardContext.WaitForReplicationCommit(waitCtx, namespaceID.String(), failoverVersion, barrier, commitClusters)
 	handler := shardContext.GetMetricsHandler().WithTags(metrics.NamespaceTag(nsName))
 	metrics.SyncReplicationCommitLatency.With(handler).Record(time.Since(start))
+	if fencedBy != "" {
+		// The cluster is active at a newer failover version and may have discarded this write. It will
+		// never be acknowledged here; the caller should go to the new active cluster.
+		metrics.SyncReplicationCommitFenced.With(handler).Record(1)
+		return serviceerror.NewNamespaceNotActive(nsName, currentCluster, fencedBy)
+	}
 	if err != nil {
 		metrics.SyncReplicationCommitTimeout.With(handler).Record(1)
 		return serviceerror.NewUnavailablef(
-			"sync replication: transaction not acknowledged by clusters %v: %v", clusters, err,
+			"sync replication: transaction not acknowledged by clusters %v: %v", commitClusters(), err,
 		)
 	}
 	return nil

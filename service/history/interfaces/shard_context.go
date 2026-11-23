@@ -81,9 +81,14 @@ type (
 
 		UpdateRemoteClusterInfo(cluster string, ackTaskID int64, ackTimestamp time.Time)
 		UpdateRemoteReaderInfo(readerID int64, ackTaskID int64, ackTimestamp time.Time) error
-		// WaitForReplicationCommit blocks until each of the given remote clusters has acknowledged
-		// applying every replication task of this shard with ID <= taskID, or ctx is done.
-		WaitForReplicationCommit(ctx context.Context, clusters []string, taskID int64) error
+		// WaitForReplicationCommit blocks until each cluster returned by clusters (re-evaluated while
+		// waiting) has acknowledged every replication task of this shard with ID <= taskID. It returns
+		// the name of a cluster whose fencing notice rules out acknowledging a write of namespaceID made
+		// under failoverVersion, if any.
+		WaitForReplicationCommit(ctx context.Context, namespaceID string, failoverVersion int64, taskID int64, clusters func() []string) (fencedBy string, err error)
+		// UpdateRemoteReaderFencing records a remote shard's fencing notice: the failover version at
+		// which it is active for each listed sync replication namespace.
+		UpdateRemoteReaderFencing(readerID int64, activeNamespaceFailoverVersions map[string]int64) error
 		// RecordSyncReplicationBarrier records that a persisted transaction waits for sync replication
 		// to acknowledge every replication task with ID <= taskID.
 		RecordSyncReplicationBarrier(taskID int64)

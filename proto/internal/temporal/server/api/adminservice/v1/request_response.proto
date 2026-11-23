@@ -840,3 +840,59 @@ message CountExecutionsResponse {
     int64 count = 2;
   }
 }
+
+message UpdateSyncReplicationStateRequest {
+  // Namespace names.
+  repeated string namespaces = 1;
+  // The membership record to apply to each namespace.
+  temporal.server.api.persistence.v1.NamespaceSyncReplication state = 2;
+}
+
+message UpdateSyncReplicationStateResponse {
+  message Result {
+    string namespace = 1;
+    // Version stored for the namespace after the call.
+    int64 stored_version = 2;
+    // False if the stored record already had this or a newer version.
+    bool applied = 3;
+  }
+  repeated Result results = 1;
+}
+
+message GetSyncReplicationStatusRequest {
+  string namespace = 1;
+}
+
+message GetSyncReplicationStatusResponse {
+  string namespace = 1;
+  string namespace_id = 2;
+  // The namespace as this cluster sees it.
+  string active_cluster = 3;
+  int64 failover_version = 4;
+  // The stored membership record.
+  temporal.server.api.persistence.v1.NamespaceSyncReplication state = 5;
+  // Lowest record version applied across all history shards of this cluster.
+  int64 min_applied_version = 6;
+  // Lowest failover version for the namespace seen across all history shards of this cluster. Equal
+  // to failover_version once every history host has learned the latest failover.
+  int64 min_known_failover_version = 8;
+
+  message ShardProgress {
+    int32 shard_id = 1;
+    // Highest replication task ID a sync replication write of the shard may wait on.
+    int64 sync_replication_barrier = 2;
+    // Replication tasks of the shard the peer has acked.
+    int64 acked_task_id = 3;
+  }
+  message PeerStatus {
+    string cluster = 1;
+    // The peer has acked every sync replication write of every shard of this cluster. On the active
+    // cluster: the peer has caught up. On a returning old active: its writes are drained to the peer.
+    bool drained = 2;
+    // Highest failover version the peer reported it is active at for this namespace (fencing), or 0.
+    int64 fenced_at_failover_version = 3;
+    repeated ShardProgress shards = 4;
+  }
+  repeated PeerStatus peers = 7;
+}
+

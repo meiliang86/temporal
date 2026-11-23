@@ -259,6 +259,16 @@ func (c *clientImpl) GetShard(
 	return c.client.GetShard(ctx, request, opts...)
 }
 
+func (c *clientImpl) GetSyncReplicationStatus(
+	ctx context.Context,
+	request *adminservice.GetSyncReplicationStatusRequest,
+	opts ...grpc.CallOption,
+) (*adminservice.GetSyncReplicationStatusResponse, error) {
+	ctx, cancel := c.createContext(ctx)
+	defer cancel()
+	return c.client.GetSyncReplicationStatus(ctx, request, opts...)
+}
+
 func (c *clientImpl) GetTaskQueueTasks(
 	ctx context.Context,
 	request *adminservice.GetTaskQueueTasksRequest,
@@ -497,4 +507,14 @@ func (c *clientImpl) SyncWorkflowState(
 	ctx, cancel := c.createContextWithStateSyncTimeout(ctx)
 	defer cancel()
 	return c.client.SyncWorkflowState(ctx, request, opts...)
+}
+
+func (c *clientImpl) UpdateSyncReplicationState(
+	ctx context.Context,
+	request *adminservice.UpdateSyncReplicationStateRequest,
+	opts ...grpc.CallOption,
+) (*adminservice.UpdateSyncReplicationStateResponse, error) {
+	ctx, cancel := c.createContext(ctx)
+	defer cancel()
+	return c.client.UpdateSyncReplicationState(ctx, request, opts...)
 }

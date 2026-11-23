@@ -1292,6 +1292,10 @@ var (
 		"sync_replication_commit_timeout",
 		WithDescription("Number of sync replication transactions whose acknowledgement wait timed out."),
 	)
+	SyncReplicationCommitFenced = NewCounterDef(
+		"sync_replication_commit_fenced",
+		WithDescription("Number of sync replication transactions rejected because a cluster they waited for is active at a newer failover version."),
+	)
 	// ReplicationTasksFetched records the number of tasks fetched by the poller.
 	ReplicationTasksFetched                        = NewDimensionlessHistogramDef("replication_tasks_fetched")
 	ReplicationLatency                             = NewTimerDef("replication_latency")

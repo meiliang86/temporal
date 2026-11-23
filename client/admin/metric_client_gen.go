@@ -359,6 +359,20 @@ func (c *metricClient) GetShard(
 	return c.client.GetShard(ctx, request, opts...)
 }
 
+func (c *metricClient) GetSyncReplicationStatus(
+	ctx context.Context,
+	request *adminservice.GetSyncReplicationStatusRequest,
+	opts ...grpc.CallOption,
+) (_ *adminservice.GetSyncReplicationStatusResponse, retError error) {
+
+	metricsHandler, startTime := c.startMetricsRecording(ctx, "AdminClientGetSyncReplicationStatus")
+	defer func() {
+		c.finishMetricsRecording(metricsHandler, startTime, retError)
+	}()
+
+	return c.client.GetSyncReplicationStatus(ctx, request, opts...)
+}
+
 func (c *metricClient) GetTaskQueueTasks(
 	ctx context.Context,
 	request *adminservice.GetTaskQueueTasksRequest,
@@ -693,4 +707,18 @@ func (c *metricClient) SyncWorkflowState(
 	}()
 
 	return c.client.SyncWorkflowState(ctx, request, opts...)
+}
+
+func (c *metricClient) UpdateSyncReplicationState(
+	ctx context.Context,
+	request *adminservice.UpdateSyncReplicationStateRequest,
+	opts ...grpc.CallOption,
+) (_ *adminservice.UpdateSyncReplicationStateResponse, retError error) {
+
+	metricsHandler, startTime := c.startMetricsRecording(ctx, "AdminClientUpdateSyncReplicationState")
+	defer func() {
+		c.finishMetricsRecording(metricsHandler, startTime, retError)
+	}()
+
+	return c.client.UpdateSyncReplicationState(ctx, request, opts...)
 }

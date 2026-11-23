@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"math/rand"
 	"testing"
 	"time"
@@ -786,9 +787,18 @@ func (s *contextSuite) TestWaitForReplicationCommit() {
 	}).AnyTimes()
 	s.mockShard.clusterMetadata = clusterMetadata
 
-	clusters := []string{cluster.TestAlternativeClusterName}
+	clusters := func() []string { return []string{cluster.TestAlternativeClusterName} }
 	readerID := func(remoteShardID int32) int64 {
 		return ReplicationReaderIDFromClusterShardID(cluster.TestAlternativeClusterInitialFailoverVersion, remoteShardID)
+	}
+	const namespaceID = "ns-id"
+	const version = int64(10)
+	wait := func(ctx context.Context, clusters func() []string) error {
+		fencedBy, err := s.mockShard.WaitForReplicationCommit(ctx, namespaceID, version, 100, clusters)
+		if fencedBy != "" {
+			return fmt.Errorf("fenced by %s", fencedBy)
+		}
+		return err
 	}
 	notDone := func(done <-chan error) {
 		select {
@@ -801,11 +811,11 @@ func (s *contextSuite) TestWaitForReplicationCommit() {
 	// Nothing acknowledged yet.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	s.ErrorIs(s.mockShard.WaitForReplicationCommit(ctx, clusters, 100), context.DeadlineExceeded)
+	s.ErrorIs(wait(ctx, clusters), context.DeadlineExceeded)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- s.mockShard.WaitForReplicationCommit(context.Background(), clusters, 100)
+		done <- wait(context.Background(), clusters)
 	}()
 
 	// Local shard 1 streams to remote shards 1 and 5: both must acknowledge.
@@ -822,11 +832,100 @@ func (s *contextSuite) TestWaitForReplicationCommit() {
 	}
 
 	// Already acknowledged.
-	s.NoError(s.mockShard.WaitForReplicationCommit(context.Background(), clusters, 100))
+	s.NoError(wait(context.Background(), clusters))
+	// No cluster to wait for (degraded mode).
+	s.NoError(wait(context.Background(), func() []string { return nil }))
 	// A cluster that never acknowledged anything blocks the commit.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel2()
-	s.Error(s.mockShard.WaitForReplicationCommit(ctx2, []string{cluster.TestAlternativeClusterName, "unknown-cluster"}, 100))
+	s.Error(wait(ctx2, func() []string { return []string{cluster.TestAlternativeClusterName, "unknown-cluster"} }))
+
+	// The set of clusters is re-evaluated while waiting: when the control plane drops the cluster
+	// that doesn't acknowledge, the pending write commits without any new acknowledgement.
+	var dropped atomic.Bool
+	go func() {
+		done <- wait(context.Background(), func() []string {
+			if dropped.Load() {
+				return []string{cluster.TestAlternativeClusterName}
+			}
+			return []string{cluster.TestAlternativeClusterName, "unknown-cluster"}
+		})
+	}()
+	notDone(done)
+	dropped.Store(true)
+	select {
+	case err := <-done:
+		s.NoError(err)
+	case <-time.After(5 * time.Second):
+		s.Fail("WaitForReplicationCommit didn't notice the membership change")
+	}
+}
+
+func (s *contextSuite) TestWaitForReplicationCommit_Fencing() {
+	clusterMetadata := cluster.NewMockMetadata(s.controller)
+	clusterMetadata.EXPECT().GetClusterID().Return(cluster.TestCurrentClusterInitialFailoverVersion).AnyTimes()
+	clusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	clusterMetadata.EXPECT().GetAllClusterInfo().Return(cluster.TestAllClusterInfo).AnyTimes()
+	s.mockShard.clusterMetadata = clusterMetadata
+
+	clusters := func() []string { return []string{cluster.TestAlternativeClusterName} }
+	readerID := ReplicationReaderIDFromClusterShardID(cluster.TestAlternativeClusterInitialFailoverVersion, s.mockShard.shardID)
+	const namespaceID = "ns-id"
+
+	// The peer acknowledged task 100 and then reported it is active for the namespace at version 12.
+	s.NoError(s.mockShard.UpdateRemoteReaderFencing(readerID, map[string]int64{namespaceID: 12, "other-ns": 50}))
+	s.NoError(s.mockShard.UpdateRemoteReaderInfo(readerID, 100, time.Now()))
+
+	// A write made under an older failover version is fenced: the peer may have discarded it.
+	fencedBy, err := s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 11, 100, clusters)
+	s.NoError(err)
+	s.Equal(cluster.TestAlternativeClusterName, fencedBy)
+
+	// Fenced right away, even before the peer acknowledges the write.
+	fencedBy, err = s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 11, 500, clusters)
+	s.NoError(err)
+	s.Equal(cluster.TestAlternativeClusterName, fencedBy)
+
+	// Writes under the fencing version or a newer one (after a failback) commit normally.
+	fencedBy, err = s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 12, 100, clusters)
+	s.NoError(err)
+	s.Empty(fencedBy)
+	fencedBy, err = s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 22, 100, clusters)
+	s.NoError(err)
+	s.Empty(fencedBy)
+
+	// Other namespaces aren't affected by this namespace's fence.
+	fencedBy, err = s.mockShard.WaitForReplicationCommit(context.Background(), "unrelated-ns", 1, 100, clusters)
+	s.NoError(err)
+	s.Empty(fencedBy)
+
+	// Fences only grow.
+	s.NoError(s.mockShard.UpdateRemoteReaderFencing(readerID, map[string]int64{namespaceID: 5}))
+	fencedBy, err = s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 11, 100, clusters)
+	s.NoError(err)
+	s.Equal(cluster.TestAlternativeClusterName, fencedBy)
+
+	// A pending write is woken by a fencing notice that arrives while it waits.
+	done := make(chan string, 1)
+	go func() {
+		fencedBy, _ := s.mockShard.WaitForReplicationCommit(context.Background(), namespaceID, 20, 200, clusters)
+		done <- fencedBy
+	}()
+	s.NoError(s.mockShard.UpdateRemoteReaderFencing(readerID, map[string]int64{namespaceID: 32}))
+	select {
+	case fencedBy := <-done:
+		s.Equal(cluster.TestAlternativeClusterName, fencedBy)
+	case <-time.After(5 * time.Second):
+		s.Fail("pending write not woken by the fencing notice")
+	}
+
+	// The notice is reported by GetReplicationStatus.
+	status, _, err := s.mockShard.GetReplicationStatus([]string{cluster.TestAlternativeClusterName})
+	s.NoError(err)
+	s.Equal(map[string]int64{namespaceID: 32, "other-ns": 50}, status[cluster.TestAlternativeClusterName].GetFencedNamespaceFailoverVersions())
+
+	// Unknown clusters are rejected.
+	s.Error(s.mockShard.UpdateRemoteReaderFencing(ReplicationReaderIDFromClusterShardID(12345, 1), map[string]int64{namespaceID: 1}))
 }
 
 func (s *contextSuite) TestSyncReplicationBarrier() {

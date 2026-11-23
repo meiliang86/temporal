@@ -2,12 +2,16 @@ package workflow
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/api/serviceerror"
+	historyspb "go.temporal.io/server/api/history/v1"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
+	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/dynamicconfig"
@@ -15,6 +19,7 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence/versionhistory"
 	"go.temporal.io/server/common/testing/testhooks"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/tasks"
@@ -35,7 +40,20 @@ func newSyncReplicationTestContext() *ContextImpl {
 	)
 }
 
+// Failover versions in the tests: localVersion belongs to the current cluster, remoteVersion to the
+// alternative cluster.
+var (
+	localVersion  = tests.Version
+	remoteVersion = tests.Version + 1
+)
+
 func newSyncReplicationTestShard(t *testing.T, enabled bool) *historyi.MockShardContext {
+	return newSyncReplicationTestShardWithNamespace(t, enabled, func() *namespace.Namespace { return tests.GlobalNamespaceEntry })
+}
+
+// newSyncReplicationTestShardWithNamespace returns a shard whose namespace registry returns the
+// namespace from entry on every lookup, so a test can change it while a write waits.
+func newSyncReplicationTestShardWithNamespace(t *testing.T, enabled bool, entry func() *namespace.Namespace) *historyi.MockShardContext {
 	controller := gomock.NewController(t)
 	config := tests.NewDynamicConfig()
 	config.SyncReplicationEnabled = dynamicconfig.GetBoolPropertyFnFilteredByNamespace(enabled)
@@ -43,8 +61,18 @@ func newSyncReplicationTestShard(t *testing.T, enabled bool) *historyi.MockShard
 
 	clusterMetadata := cluster.NewMockMetadata(controller)
 	clusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	clusterMetadata.EXPECT().ClusterNameForFailoverVersion(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ bool, version int64) string {
+			if version == remoteVersion {
+				return cluster.TestAlternativeClusterName
+			}
+			return cluster.TestCurrentClusterName
+		},
+	).AnyTimes()
 	namespaceRegistry := namespace.NewMockRegistry(controller)
-	namespaceRegistry.EXPECT().GetNamespaceByID(tests.NamespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
+	namespaceRegistry.EXPECT().GetNamespaceByID(tests.NamespaceID).DoAndReturn(
+		func(namespace.ID) (*namespace.Namespace, error) { return entry(), nil },
+	).AnyTimes()
 
 	shardContext := historyi.NewMockShardContext(controller)
 	shardContext.EXPECT().GetConfig().Return(config).AnyTimes()
@@ -52,6 +80,24 @@ func newSyncReplicationTestShard(t *testing.T, enabled bool) *historyi.MockShard
 	shardContext.EXPECT().GetNamespaceRegistry().Return(namespaceRegistry).AnyTimes()
 	shardContext.EXPECT().GetMetricsHandler().Return(metrics.NoopMetricsHandler).AnyTimes()
 	return shardContext
+}
+
+// namespaceWithRecord returns the test global namespace (active in the current cluster unless
+// activeCluster says otherwise) with the given sync replication membership record.
+func namespaceWithRecord(activeCluster string, record *persistencespb.NamespaceSyncReplication, clusters ...string) *namespace.Namespace {
+	if len(clusters) == 0 {
+		clusters = []string{cluster.TestCurrentClusterName, cluster.TestAlternativeClusterName}
+	}
+	return namespace.NewGlobalNamespaceForTest(
+		&persistencespb.NamespaceInfo{Id: tests.NamespaceID.String(), Name: tests.Namespace.String()},
+		&persistencespb.NamespaceConfig{},
+		&persistencespb.NamespaceReplicationConfig{
+			ActiveClusterName: activeCluster,
+			Clusters:          clusters,
+			SyncReplication:   record,
+		},
+		localVersion,
+	)
 }
 
 // replicationTasks returns a task map with one replication task with the given ID.
@@ -110,41 +156,165 @@ func TestSyncReplicationClusters(t *testing.T) {
 	require.Nil(t, SyncReplicationClusters(disabled, tests.GlobalNamespaceEntry, tests.WorkflowID))
 }
 
+func TestSyncReplicationCommitClusters(t *testing.T) {
+	current, alternative, third := cluster.TestCurrentClusterName, cluster.TestAlternativeClusterName, "third"
+	commitClusters := func(record *persistencespb.NamespaceSyncReplication) []string {
+		return syncReplicationCommitClusters(current, namespaceWithRecord(current, record, current, alternative, third), tests.WorkflowID)
+	}
+
+	// No record from the control plane: every cluster of the namespace.
+	require.Equal(t, []string{alternative, third}, commitClusters(nil))
+	// Full quorum.
+	require.Equal(t, []string{alternative}, commitClusters(&persistencespb.NamespaceSyncReplication{
+		Version: 1, InSyncClusters: []string{current, alternative},
+	}))
+	// Degraded mode: the active cluster is the only member and commits alone.
+	require.Empty(t, commitClusters(&persistencespb.NamespaceSyncReplication{
+		Version: 2, InSyncClusters: []string{current},
+	}))
+	// Rejoin, step 1: commits wait for the joining cluster too.
+	require.Equal(t, []string{alternative}, commitClusters(&persistencespb.NamespaceSyncReplication{
+		Version: 3, InSyncClusters: []string{current}, JoiningClusters: []string{alternative},
+	}))
+	// After a forced failover the old active is dropped from the record, but while it still believes
+	// it is active it keeps waiting for the in-sync members (and is fenced by them).
+	require.Equal(t, []string{alternative}, commitClusters(&persistencespb.NamespaceSyncReplication{
+		Version: 4, InSyncClusters: []string{alternative},
+	}))
+	// Duplicates are ignored.
+	require.Equal(t, []string{alternative, third}, commitClusters(&persistencespb.NamespaceSyncReplication{
+		Version: 5, InSyncClusters: []string{current, alternative, third}, JoiningClusters: []string{alternative},
+	}))
+}
+
+func TestLastWriteFailoverVersion(t *testing.T) {
+	require.Equal(t, int64(7), lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{
+		VersionHistories: versionhistory.NewVersionHistories(versionhistory.NewVersionHistory(nil, []*historyspb.VersionHistoryItem{
+			versionhistory.NewVersionHistoryItem(3, 5),
+			versionhistory.NewVersionHistoryItem(9, 7),
+		})),
+	}))
+	require.Equal(t, int64(11), lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{
+		VersionHistories: versionhistory.NewVersionHistories(versionhistory.NewVersionHistory(nil, []*historyspb.VersionHistoryItem{
+			versionhistory.NewVersionHistoryItem(9, 7),
+		})),
+		TransitionHistory: []*persistencespb.VersionedTransition{
+			{NamespaceFailoverVersion: 7, TransitionCount: 3},
+			{NamespaceFailoverVersion: 11, TransitionCount: 4},
+		},
+	}))
+	require.Equal(t, common.EmptyVersion, lastWriteFailoverVersion(&persistencespb.WorkflowExecutionInfo{}))
+}
+
 func TestWaitForSyncReplication(t *testing.T) {
+	ctx := context.Background()
+	nsID := tests.NamespaceID.String()
+
 	t.Run("no replication task", func(t *testing.T) {
 		shardContext := newSyncReplicationTestShard(t, true)
-		require.NoError(t, waitForSyncReplication(context.Background(), shardContext, tests.NamespaceID.String(), tests.WorkflowID, map[tasks.Category][]tasks.Task{}))
+		require.NoError(t, waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, map[tasks.Category][]tasks.Task{}))
 	})
 
 	t.Run("disabled", func(t *testing.T) {
 		shardContext := newSyncReplicationTestShard(t, false)
-		require.NoError(t, waitForSyncReplication(context.Background(), shardContext, tests.NamespaceID.String(), tests.WorkflowID, replicationTasks(10)))
+		require.NoError(t, waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10)))
+	})
+
+	t.Run("replication applied from another cluster doesn't wait", func(t *testing.T) {
+		shardContext := newSyncReplicationTestShard(t, true)
+		require.NoError(t, waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, remoteVersion, replicationTasks(10)))
 	})
 
 	t.Run("acknowledged", func(t *testing.T) {
 		shardContext := newSyncReplicationTestShard(t, true)
 		expectReplicationNotification(t, shardContext)
-		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), []string{cluster.TestAlternativeClusterName}, int64(10)).Return(nil)
-		require.NoError(t, waitForSyncReplication(context.Background(), shardContext, tests.NamespaceID.String(), tests.WorkflowID, replicationTasks(10)))
+		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), nsID, localVersion, int64(10), gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, _ int64, _ int64, clusters func() []string) (string, error) {
+				require.Equal(t, []string{cluster.TestAlternativeClusterName}, clusters())
+				return "", nil
+			},
+		)
+		require.NoError(t, waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10)))
+	})
+
+	t.Run("a write made while active waits even if this host has since learned of a failover", func(t *testing.T) {
+		// The zombie case: without this, the write would take effect without any acknowledgement.
+		shardContext := newSyncReplicationTestShardWithNamespace(t, true, func() *namespace.Namespace {
+			return namespaceWithRecord(cluster.TestAlternativeClusterName, nil)
+		})
+		expectReplicationNotification(t, shardContext)
+		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), nsID, localVersion, int64(10), gomock.Any()).
+			Return(cluster.TestAlternativeClusterName, nil)
+		err := waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10))
+		var notActive *serviceerror.NamespaceNotActive
+		require.ErrorAs(t, err, &notActive)
+		require.Equal(t, cluster.TestAlternativeClusterName, notActive.ActiveCluster)
 	})
 
 	t.Run("not acknowledged", func(t *testing.T) {
 		shardContext := newSyncReplicationTestShard(t, true)
 		expectReplicationNotification(t, shardContext)
-		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), gomock.Any(), int64(10)).Return(context.DeadlineExceeded)
-		err := waitForSyncReplication(context.Background(), shardContext, tests.NamespaceID.String(), tests.WorkflowID, replicationTasks(10))
+		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), gomock.Any(), gomock.Any(), int64(10), gomock.Any()).Return("", context.DeadlineExceeded)
+		err := waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10))
 		var unavailable *serviceerror.Unavailable
 		require.ErrorAs(t, err, &unavailable)
+	})
+
+	t.Run("fenced", func(t *testing.T) {
+		shardContext := newSyncReplicationTestShard(t, true)
+		expectReplicationNotification(t, shardContext)
+		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), gomock.Any(), gomock.Any(), int64(10), gomock.Any()).
+			Return(cluster.TestAlternativeClusterName, nil)
+		err := waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10))
+		var notActive *serviceerror.NamespaceNotActive
+		require.ErrorAs(t, err, &notActive)
+		require.Equal(t, tests.Namespace.String(), notActive.Namespace)
+		require.Equal(t, cluster.TestCurrentClusterName, notActive.CurrentCluster)
+		require.Equal(t, cluster.TestAlternativeClusterName, notActive.ActiveCluster)
+	})
+
+	t.Run("degraded mode records the barrier and doesn't wait", func(t *testing.T) {
+		shardContext := newSyncReplicationTestShardWithNamespace(t, true, func() *namespace.Namespace {
+			return namespaceWithRecord(cluster.TestCurrentClusterName, &persistencespb.NamespaceSyncReplication{
+				Version: 1, InSyncClusters: []string{cluster.TestCurrentClusterName},
+			})
+		})
+		engine := historyi.NewMockEngine(gomock.NewController(t))
+		engine.EXPECT().NotifyNewTasks(gomock.Any())
+		shardContext.EXPECT().GetEngine(gomock.Any()).Return(engine, nil)
+		shardContext.EXPECT().RecordSyncReplicationBarrier(int64(10))
+		// No WaitForReplicationCommit call expected.
+		require.NoError(t, waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10)))
+	})
+
+	t.Run("membership is re-read while waiting", func(t *testing.T) {
+		var entry atomic.Pointer[namespace.Namespace]
+		entry.Store(namespaceWithRecord(cluster.TestCurrentClusterName, &persistencespb.NamespaceSyncReplication{
+			Version: 1, InSyncClusters: []string{cluster.TestCurrentClusterName, cluster.TestAlternativeClusterName},
+		}))
+		shardContext := newSyncReplicationTestShardWithNamespace(t, true, entry.Load)
+		expectReplicationNotification(t, shardContext)
+		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), gomock.Any(), gomock.Any(), int64(10), gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, _ int64, _ int64, clusters func() []string) (string, error) {
+				require.Equal(t, []string{cluster.TestAlternativeClusterName}, clusters())
+				entry.Store(namespaceWithRecord(cluster.TestCurrentClusterName, &persistencespb.NamespaceSyncReplication{
+					Version: 2, InSyncClusters: []string{cluster.TestCurrentClusterName},
+				}))
+				require.Empty(t, clusters())
+				return "", nil
+			},
+		)
+		require.NoError(t, waitForSyncReplication(ctx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10)))
 	})
 
 	t.Run("hands the lock off while waiting", func(t *testing.T) {
 		shardContext := newSyncReplicationTestShard(t, true)
 		wfContext := newSyncReplicationTestContext()
-		require.NoError(t, wfContext.Lock(context.Background(), locks.PriorityHigh))
+		require.NoError(t, wfContext.Lock(ctx, locks.PriorityHigh))
 
 		expectReplicationNotification(t, shardContext)
-		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), gomock.Any(), int64(10)).DoAndReturn(
-			func(context.Context, []string, int64) error {
+		shardContext.EXPECT().WaitForReplicationCommit(gomock.Any(), gomock.Any(), gomock.Any(), int64(10), gomock.Any()).DoAndReturn(
+			func(context.Context, string, int64, int64, func() []string) (string, error) {
 				// The replication sender can take the lock while the writer waits...
 				readerCtx := WithSyncReplicationReader(context.Background())
 				require.NoError(t, wfContext.Lock(readerCtx, locks.PriorityLow))
@@ -153,11 +323,11 @@ func TestWaitForSyncReplication(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 				defer cancel()
 				require.ErrorIs(t, wfContext.Lock(ctx, locks.PriorityHigh), context.DeadlineExceeded)
-				return nil
+				return "", nil
 			},
 		)
-		ctx := withSyncReplicationLockHandoff(context.Background(), wfContext)
-		require.NoError(t, waitForSyncReplication(ctx, shardContext, tests.NamespaceID.String(), tests.WorkflowID, replicationTasks(10)))
+		handoffCtx := withSyncReplicationLockHandoff(ctx, wfContext)
+		require.NoError(t, waitForSyncReplication(handoffCtx, shardContext, nsID, tests.WorkflowID, localVersion, replicationTasks(10)))
 
 		// The writer owns the lock again.
 		require.True(t, wfContext.locked.Load())

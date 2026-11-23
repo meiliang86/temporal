@@ -121,6 +121,10 @@ func (wt *WorkflowTags) extractFromAdminServiceServerMessage(message any) []tag.
 		return nil
 	case *adminservice.GetShardResponse:
 		return nil
+	case *adminservice.GetSyncReplicationStatusRequest:
+		return nil
+	case *adminservice.GetSyncReplicationStatusResponse:
+		return nil
 	case *adminservice.GetTaskQueueTasksRequest:
 		return nil
 	case *adminservice.GetTaskQueueTasksResponse:
@@ -242,6 +246,10 @@ func (wt *WorkflowTags) extractFromAdminServiceServerMessage(message any) []tag.
 			tag.WorkflowRunID(r.GetExecution().GetRunId()),
 		}
 	case *adminservice.SyncWorkflowStateResponse:
+		return nil
+	case *adminservice.UpdateSyncReplicationStateRequest:
+		return nil
+	case *adminservice.UpdateSyncReplicationStateResponse:
 		return nil
 	default:
 		return nil

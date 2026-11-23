@@ -83,6 +83,10 @@ message SyncReplicationState {
   // isolated_namespace_id-tagged messages). The sender requires this before it emits
   // lane-tagged traffic, so an old receiver is never sent lanes it would misroute.
   bool supports_namespace_isolation = 7;
+  // Fencing notice for sync replication: for each sync replication namespace the receiver believes
+  // it is active for, keyed by namespace ID, its failover version. The sender must not count this
+  // ack toward a write made under an older failover version (the receiver may have ignored it).
+  map<string, int64> active_namespace_failover_versions = 8;
 }
 message ReplicationState {
   int64 inclusive_low_watermark = 1;

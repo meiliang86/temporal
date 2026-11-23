@@ -419,6 +419,7 @@ func createWorkflowExecution(
 		shardContext,
 		request.NewWorkflowSnapshot.ExecutionInfo.NamespaceId,
 		request.NewWorkflowSnapshot.ExecutionInfo.WorkflowId,
+		mutableStateFailoverVersion,
 		request.NewWorkflowSnapshot.Tasks,
 	)
 	if waitErr != nil {
@@ -496,6 +497,7 @@ func conflictResolveWorkflowExecution(
 		shardContext,
 		request.ResetWorkflowSnapshot.ExecutionInfo.NamespaceId,
 		request.ResetWorkflowSnapshot.ExecutionInfo.WorkflowId,
+		resetWorkflowFailoverVersion,
 		taskMaps...,
 	)
 	if waitErr != nil {
@@ -602,6 +604,7 @@ func updateWorkflowExecution(
 		shardContext,
 		request.UpdateWorkflowMutation.ExecutionInfo.NamespaceId,
 		request.UpdateWorkflowMutation.ExecutionInfo.WorkflowId,
+		updateWorkflowFailoverVersion,
 		taskMaps...,
 	)
 	if waitErr != nil {
@@ -633,6 +636,7 @@ func setWorkflowExecution(
 		shardContext,
 		request.SetWorkflowSnapshot.ExecutionInfo.NamespaceId,
 		request.SetWorkflowSnapshot.ExecutionInfo.WorkflowId,
+		lastWriteFailoverVersion(request.SetWorkflowSnapshot.ExecutionInfo),
 		request.SetWorkflowSnapshot.Tasks,
 	)
 	if waitErr != nil {

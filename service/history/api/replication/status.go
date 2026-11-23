@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"go.temporal.io/server/api/historyservice/v1"
+	"go.temporal.io/server/common/namespace"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/replication"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -18,6 +19,22 @@ func GetStatus(
 	resp := &historyservice.ShardReplicationStatus{
 		ShardId:        shard.GetShardID(),
 		ShardLocalTime: timestamppb.New(shard.GetTimeSource().Now()),
+	}
+
+	// Read before the remote acks below, so "acked >= barrier" means the peer has every sync
+	// replication write made before this call.
+	resp.SyncReplicationBarrier = shard.SyncReplicationBarrier()
+	for _, namespaceID := range request.GetSyncReplicationNamespaceIds() {
+		entry, err := shard.GetNamespaceRegistry().GetNamespaceByID(namespace.ID(namespaceID))
+		if err != nil {
+			return nil, err
+		}
+		if resp.SyncReplicationAppliedVersions == nil {
+			resp.SyncReplicationAppliedVersions = make(map[string]int64)
+			resp.NamespaceFailoverVersions = make(map[string]int64)
+		}
+		resp.SyncReplicationAppliedVersions[namespaceID] = entry.SyncReplication().GetVersion()
+		resp.NamespaceFailoverVersions[namespaceID] = entry.FailoverVersion(namespace.EmptyBusinessID)
 	}
 
 	maxReplicationTaskId, maxTaskVisibilityTimeStamp := replicationAckMgr.GetMaxTaskInfo()

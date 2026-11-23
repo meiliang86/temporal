@@ -772,6 +772,18 @@ func (mr *MockShardContextMockRecorder) NewVectorClock() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewVectorClock", reflect.TypeOf((*MockShardContext)(nil).NewVectorClock))
 }
 
+// RecordSyncReplicationBarrier mocks base method.
+func (m *MockShardContext) RecordSyncReplicationBarrier(taskID int64) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "RecordSyncReplicationBarrier", taskID)
+}
+
+// RecordSyncReplicationBarrier indicates an expected call of RecordSyncReplicationBarrier.
+func (mr *MockShardContextMockRecorder) RecordSyncReplicationBarrier(taskID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecordSyncReplicationBarrier", reflect.TypeOf((*MockShardContext)(nil).RecordSyncReplicationBarrier), taskID)
+}
+
 // SetCurrentTime mocks base method.
 func (m *MockShardContext) SetCurrentTime(arg0 string, currentTime time.Time) {
 	m.ctrl.T.Helper()
@@ -827,6 +839,20 @@ func (mr *MockShardContextMockRecorder) StateMachineRegistry() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateMachineRegistry", reflect.TypeOf((*MockShardContext)(nil).StateMachineRegistry))
 }
 
+// SyncReplicationBarrier mocks base method.
+func (m *MockShardContext) SyncReplicationBarrier() int64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SyncReplicationBarrier")
+	ret0, _ := ret[0].(int64)
+	return ret0
+}
+
+// SyncReplicationBarrier indicates an expected call of SyncReplicationBarrier.
+func (mr *MockShardContextMockRecorder) SyncReplicationBarrier() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncReplicationBarrier", reflect.TypeOf((*MockShardContext)(nil).SyncReplicationBarrier))
+}
+
 // UnloadForOwnershipLost mocks base method.
 func (m *MockShardContext) UnloadForOwnershipLost() {
 	m.ctrl.T.Helper()
@@ -863,44 +889,18 @@ func (mr *MockShardContextMockRecorder) UpdateRemoteClusterInfo(arg0, ackTaskID,
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRemoteClusterInfo", reflect.TypeOf((*MockShardContext)(nil).UpdateRemoteClusterInfo), arg0, ackTaskID, ackTimestamp)
 }
 
-// RecordSyncReplicationBarrier mocks base method.
-func (m *MockShardContext) RecordSyncReplicationBarrier(taskID int64) {
+// UpdateRemoteReaderFencing mocks base method.
+func (m *MockShardContext) UpdateRemoteReaderFencing(readerID int64, activeNamespaceFailoverVersions map[string]int64) error {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "RecordSyncReplicationBarrier", taskID)
-}
-
-// RecordSyncReplicationBarrier indicates an expected call of RecordSyncReplicationBarrier.
-func (mr *MockShardContextMockRecorder) RecordSyncReplicationBarrier(taskID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecordSyncReplicationBarrier", reflect.TypeOf((*MockShardContext)(nil).RecordSyncReplicationBarrier), taskID)
-}
-
-// SyncReplicationBarrier mocks base method.
-func (m *MockShardContext) SyncReplicationBarrier() int64 {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SyncReplicationBarrier")
-	ret0, _ := ret[0].(int64)
-	return ret0
-}
-
-// SyncReplicationBarrier indicates an expected call of SyncReplicationBarrier.
-func (mr *MockShardContextMockRecorder) SyncReplicationBarrier() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncReplicationBarrier", reflect.TypeOf((*MockShardContext)(nil).SyncReplicationBarrier))
-}
-
-// WaitForReplicationCommit mocks base method.
-func (m *MockShardContext) WaitForReplicationCommit(ctx context.Context, clusters []string, taskID int64) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "WaitForReplicationCommit", ctx, clusters, taskID)
+	ret := m.ctrl.Call(m, "UpdateRemoteReaderFencing", readerID, activeNamespaceFailoverVersions)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
-// WaitForReplicationCommit indicates an expected call of WaitForReplicationCommit.
-func (mr *MockShardContextMockRecorder) WaitForReplicationCommit(ctx, clusters, taskID any) *gomock.Call {
+// UpdateRemoteReaderFencing indicates an expected call of UpdateRemoteReaderFencing.
+func (mr *MockShardContextMockRecorder) UpdateRemoteReaderFencing(readerID, activeNamespaceFailoverVersions any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitForReplicationCommit", reflect.TypeOf((*MockShardContext)(nil).WaitForReplicationCommit), ctx, clusters, taskID)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRemoteReaderFencing", reflect.TypeOf((*MockShardContext)(nil).UpdateRemoteReaderFencing), readerID, activeNamespaceFailoverVersions)
 }
 
 // UpdateRemoteReaderInfo mocks base method.
@@ -958,6 +958,21 @@ func (m *MockShardContext) UpdateWorkflowExecution(ctx context.Context, request 
 func (mr *MockShardContextMockRecorder) UpdateWorkflowExecution(ctx, request any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateWorkflowExecution", reflect.TypeOf((*MockShardContext)(nil).UpdateWorkflowExecution), ctx, request)
+}
+
+// WaitForReplicationCommit mocks base method.
+func (m *MockShardContext) WaitForReplicationCommit(ctx context.Context, namespaceID string, failoverVersion, taskID int64, clusters func() []string) (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WaitForReplicationCommit", ctx, namespaceID, failoverVersion, taskID, clusters)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WaitForReplicationCommit indicates an expected call of WaitForReplicationCommit.
+func (mr *MockShardContextMockRecorder) WaitForReplicationCommit(ctx, namespaceID, failoverVersion, taskID, clusters any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitForReplicationCommit", reflect.TypeOf((*MockShardContext)(nil).WaitForReplicationCommit), ctx, namespaceID, failoverVersion, taskID, clusters)
 }
 
 // MockControllableContext is a mock of ControllableContext interface.
@@ -1728,6 +1743,18 @@ func (mr *MockControllableContextMockRecorder) NewVectorClock() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewVectorClock", reflect.TypeOf((*MockControllableContext)(nil).NewVectorClock))
 }
 
+// RecordSyncReplicationBarrier mocks base method.
+func (m *MockControllableContext) RecordSyncReplicationBarrier(taskID int64) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "RecordSyncReplicationBarrier", taskID)
+}
+
+// RecordSyncReplicationBarrier indicates an expected call of RecordSyncReplicationBarrier.
+func (mr *MockControllableContextMockRecorder) RecordSyncReplicationBarrier(taskID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecordSyncReplicationBarrier", reflect.TypeOf((*MockControllableContext)(nil).RecordSyncReplicationBarrier), taskID)
+}
+
 // SetCurrentTime mocks base method.
 func (m *MockControllableContext) SetCurrentTime(arg0 string, currentTime time.Time) {
 	m.ctrl.T.Helper()
@@ -1783,6 +1810,20 @@ func (mr *MockControllableContextMockRecorder) StateMachineRegistry() *gomock.Ca
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateMachineRegistry", reflect.TypeOf((*MockControllableContext)(nil).StateMachineRegistry))
 }
 
+// SyncReplicationBarrier mocks base method.
+func (m *MockControllableContext) SyncReplicationBarrier() int64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SyncReplicationBarrier")
+	ret0, _ := ret[0].(int64)
+	return ret0
+}
+
+// SyncReplicationBarrier indicates an expected call of SyncReplicationBarrier.
+func (mr *MockControllableContextMockRecorder) SyncReplicationBarrier() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncReplicationBarrier", reflect.TypeOf((*MockControllableContext)(nil).SyncReplicationBarrier))
+}
+
 // UnloadForOwnershipLost mocks base method.
 func (m *MockControllableContext) UnloadForOwnershipLost() {
 	m.ctrl.T.Helper()
@@ -1819,44 +1860,18 @@ func (mr *MockControllableContextMockRecorder) UpdateRemoteClusterInfo(arg0, ack
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRemoteClusterInfo", reflect.TypeOf((*MockControllableContext)(nil).UpdateRemoteClusterInfo), arg0, ackTaskID, ackTimestamp)
 }
 
-// RecordSyncReplicationBarrier mocks base method.
-func (m *MockControllableContext) RecordSyncReplicationBarrier(taskID int64) {
+// UpdateRemoteReaderFencing mocks base method.
+func (m *MockControllableContext) UpdateRemoteReaderFencing(readerID int64, activeNamespaceFailoverVersions map[string]int64) error {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "RecordSyncReplicationBarrier", taskID)
-}
-
-// RecordSyncReplicationBarrier indicates an expected call of RecordSyncReplicationBarrier.
-func (mr *MockControllableContextMockRecorder) RecordSyncReplicationBarrier(taskID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RecordSyncReplicationBarrier", reflect.TypeOf((*MockControllableContext)(nil).RecordSyncReplicationBarrier), taskID)
-}
-
-// SyncReplicationBarrier mocks base method.
-func (m *MockControllableContext) SyncReplicationBarrier() int64 {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SyncReplicationBarrier")
-	ret0, _ := ret[0].(int64)
-	return ret0
-}
-
-// SyncReplicationBarrier indicates an expected call of SyncReplicationBarrier.
-func (mr *MockControllableContextMockRecorder) SyncReplicationBarrier() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncReplicationBarrier", reflect.TypeOf((*MockControllableContext)(nil).SyncReplicationBarrier))
-}
-
-// WaitForReplicationCommit mocks base method.
-func (m *MockControllableContext) WaitForReplicationCommit(ctx context.Context, clusters []string, taskID int64) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "WaitForReplicationCommit", ctx, clusters, taskID)
+	ret := m.ctrl.Call(m, "UpdateRemoteReaderFencing", readerID, activeNamespaceFailoverVersions)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
-// WaitForReplicationCommit indicates an expected call of WaitForReplicationCommit.
-func (mr *MockControllableContextMockRecorder) WaitForReplicationCommit(ctx, clusters, taskID any) *gomock.Call {
+// UpdateRemoteReaderFencing indicates an expected call of UpdateRemoteReaderFencing.
+func (mr *MockControllableContextMockRecorder) UpdateRemoteReaderFencing(readerID, activeNamespaceFailoverVersions any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitForReplicationCommit", reflect.TypeOf((*MockControllableContext)(nil).WaitForReplicationCommit), ctx, clusters, taskID)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRemoteReaderFencing", reflect.TypeOf((*MockControllableContext)(nil).UpdateRemoteReaderFencing), readerID, activeNamespaceFailoverVersions)
 }
 
 // UpdateRemoteReaderInfo mocks base method.
@@ -1914,4 +1929,19 @@ func (m *MockControllableContext) UpdateWorkflowExecution(ctx context.Context, r
 func (mr *MockControllableContextMockRecorder) UpdateWorkflowExecution(ctx, request any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateWorkflowExecution", reflect.TypeOf((*MockControllableContext)(nil).UpdateWorkflowExecution), ctx, request)
+}
+
+// WaitForReplicationCommit mocks base method.
+func (m *MockControllableContext) WaitForReplicationCommit(ctx context.Context, namespaceID string, failoverVersion, taskID int64, clusters func() []string) (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WaitForReplicationCommit", ctx, namespaceID, failoverVersion, taskID, clusters)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WaitForReplicationCommit indicates an expected call of WaitForReplicationCommit.
+func (mr *MockControllableContextMockRecorder) WaitForReplicationCommit(ctx, namespaceID, failoverVersion, taskID, clusters any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitForReplicationCommit", reflect.TypeOf((*MockControllableContext)(nil).WaitForReplicationCommit), ctx, namespaceID, failoverVersion, taskID, clusters)
 }

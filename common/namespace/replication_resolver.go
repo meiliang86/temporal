@@ -5,6 +5,7 @@ import (
 
 	enumspb "go.temporal.io/api/enums/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/common"
 )
 
 // RoutingStrategy determines how a business ID is used for routing decisions.
@@ -148,6 +149,9 @@ func (r *defaultReplicationResolver) Clone() ReplicationResolver {
 		clonedConfig = &persistencespb.NamespaceReplicationConfig{
 			ActiveClusterName: r.replicationConfig.ActiveClusterName,
 			State:             r.replicationConfig.State,
+		}
+		if r.replicationConfig.SyncReplication != nil {
+			clonedConfig.SyncReplication = common.CloneProto(r.replicationConfig.SyncReplication)
 		}
 		// Deep copy the clusters slice
 		if r.replicationConfig.Clusters != nil {

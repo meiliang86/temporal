@@ -212,6 +212,32 @@ func (s *streamSenderSuite) TestRecvSyncReplicationState_ReaderGroupEquivalence(
 	s.streamSender.readerGroup = nil
 }
 
+// The sync replication fencing notice is recorded before the watermark it travels with: a write
+// waiting on the watermark must never see it advance without the notice.
+func (s *streamSenderSuite) TestRecvSyncReplicationState_RecordsFencingBeforeWatermark() {
+	s.streamSender.isTieredStackEnabled = false
+	readerID := shard.ReplicationReaderIDFromClusterShardID(
+		int64(s.clientShardKey.ClusterID),
+		s.clientShardKey.ShardID,
+	)
+	fences := map[string]int64{"ns-id": 22}
+	replicationState := &replicationspb.SyncReplicationState{
+		InclusiveLowWatermark:           100,
+		InclusiveLowWatermarkTime:       timestamppb.New(time.Unix(0, 1)),
+		ActiveNamespaceFailoverVersions: fences,
+	}
+	gomock.InOrder(
+		s.shardContext.EXPECT().UpdateRemoteReaderFencing(readerID, fences).Return(nil),
+		s.shardContext.EXPECT().UpdateReplicationQueueReaderState(readerID, gomock.Any()).Return(nil),
+		s.shardContext.EXPECT().UpdateRemoteReaderInfo(readerID, int64(99), gomock.Any()).Return(nil),
+	)
+	s.NoError(s.streamSender.recvSyncReplicationState(replicationState))
+
+	// If the notice can't be recorded, the watermark doesn't move either.
+	s.shardContext.EXPECT().UpdateRemoteReaderFencing(readerID, fences).Return(errors.New("unknown cluster"))
+	s.Error(s.streamSender.recvSyncReplicationState(replicationState))
+}
+
 func (s *streamSenderSuite) TestRecvSyncReplicationState_SingleStack_Error() {
 	s.streamSender.isTieredStackEnabled = false
 	readerID := shard.ReplicationReaderIDFromClusterShardID(

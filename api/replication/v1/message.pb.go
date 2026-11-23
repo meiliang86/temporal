@@ -439,8 +439,12 @@ type SyncReplicationState struct {
 	// isolated_namespace_id-tagged messages). The sender requires this before it emits
 	// lane-tagged traffic, so an old receiver is never sent lanes it would misroute.
 	SupportsNamespaceIsolation bool `protobuf:"varint,7,opt,name=supports_namespace_isolation,json=supportsNamespaceIsolation,proto3" json:"supports_namespace_isolation,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	// Fencing notice for sync replication: for each sync replication namespace the receiver believes
+	// it is active for, keyed by namespace ID, its failover version. The sender must not count this
+	// ack toward a write made under an older failover version (the receiver may have ignored it).
+	ActiveNamespaceFailoverVersions map[string]int64 `protobuf:"bytes,8,rep,name=active_namespace_failover_versions,json=activeNamespaceFailoverVersions,proto3" json:"active_namespace_failover_versions,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	unknownFields                   protoimpl.UnknownFields
+	sizeCache                       protoimpl.SizeCache
 }
 
 func (x *SyncReplicationState) Reset() {
@@ -520,6 +524,13 @@ func (x *SyncReplicationState) GetSupportsNamespaceIsolation() bool {
 		return x.SupportsNamespaceIsolation
 	}
 	return false
+}
+
+func (x *SyncReplicationState) GetActiveNamespaceFailoverVersions() map[string]int64 {
+	if x != nil {
+		return x.ActiveNamespaceFailoverVersions
+	}
+	return nil
 }
 
 type ReplicationState struct {
@@ -2213,7 +2224,7 @@ const file_temporal_server_api_replication_v1_message_proto_rawDesc = "" +
 	"\x1elast_processed_visibility_time\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x1blastProcessedVisibilityTime\"N\n" +
 	"\x0fSyncShardStatus\x12;\n" +
 	"\vstatus_time\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"statusTime\"\xf8\x05\n" +
+	"statusTime\"\xf9\a\n" +
 	"\x14SyncReplicationState\x126\n" +
 	"\x17inclusive_low_watermark\x18\x01 \x01(\x03R\x15inclusiveLowWatermark\x12[\n" +
 	"\x1cinclusive_low_watermark_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x19inclusiveLowWatermarkTime\x12d\n" +
@@ -2221,10 +2232,14 @@ const file_temporal_server_api_replication_v1_message_proto_rawDesc = "" +
 	"\x12low_priority_state\x18\x04 \x01(\v24.temporal.server.api.replication.v1.ReplicationStateR\x10lowPriorityState\x12=\n" +
 	"\x1bthrottle_high_namespace_ids\x18\x05 \x03(\tR\x18throttleHighNamespaceIds\x12\x82\x01\n" +
 	"\x14isolated_lane_states\x18\x06 \x03(\v2P.temporal.server.api.replication.v1.SyncReplicationState.IsolatedLaneStatesEntryR\x12isolatedLaneStates\x12@\n" +
-	"\x1csupports_namespace_isolation\x18\a \x01(\bR\x1asupportsNamespaceIsolation\x1a{\n" +
+	"\x1csupports_namespace_isolation\x18\a \x01(\bR\x1asupportsNamespaceIsolation\x12\xaa\x01\n" +
+	"\"active_namespace_failover_versions\x18\b \x03(\v2].temporal.server.api.replication.v1.SyncReplicationState.ActiveNamespaceFailoverVersionsEntryR\x1factiveNamespaceFailoverVersions\x1a{\n" +
 	"\x17IsolatedLaneStatesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12J\n" +
-	"\x05value\x18\x02 \x01(\v24.temporal.server.api.replication.v1.ReplicationStateR\x05value:\x028\x01\"\x96\x02\n" +
+	"\x05value\x18\x02 \x01(\v24.temporal.server.api.replication.v1.ReplicationStateR\x05value:\x028\x01\x1aR\n" +
+	"$ActiveNamespaceFailoverVersionsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\"\x96\x02\n" +
 	"\x10ReplicationState\x126\n" +
 	"\x17inclusive_low_watermark\x18\x01 \x01(\x03R\x15inclusiveLowWatermark\x12[\n" +
 	"\x1cinclusive_low_watermark_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x19inclusiveLowWatermarkTime\x12m\n" +
@@ -2390,7 +2405,7 @@ func file_temporal_server_api_replication_v1_message_proto_rawDescGZIP() []byte 
 	return file_temporal_server_api_replication_v1_message_proto_rawDescData
 }
 
-var file_temporal_server_api_replication_v1_message_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_temporal_server_api_replication_v1_message_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_temporal_server_api_replication_v1_message_proto_goTypes = []any{
 	(*ReplicationTask)(nil),                         // 0: temporal.server.api.replication.v1.ReplicationTask
 	(*ReplicationToken)(nil),                        // 1: temporal.server.api.replication.v1.ReplicationToken
@@ -2416,33 +2431,34 @@ var file_temporal_server_api_replication_v1_message_proto_goTypes = []any{
 	(*VersionedTransitionArtifact)(nil),             // 21: temporal.server.api.replication.v1.VersionedTransitionArtifact
 	(*MigrationExecutionInfo)(nil),                  // 22: temporal.server.api.replication.v1.MigrationExecutionInfo
 	nil,                                             // 23: temporal.server.api.replication.v1.SyncReplicationState.IsolatedLaneStatesEntry
-	(v1.ReplicationTaskType)(0),                     // 24: temporal.server.api.enums.v1.ReplicationTaskType
-	(*v11.DataBlob)(nil),                            // 25: temporal.api.common.v1.DataBlob
-	(*timestamppb.Timestamp)(nil),                   // 26: google.protobuf.Timestamp
-	(v1.TaskPriority)(0),                            // 27: temporal.server.api.enums.v1.TaskPriority
-	(*v12.VersionedTransition)(nil),                 // 28: temporal.server.api.persistence.v1.VersionedTransition
-	(*v12.ReplicationTaskInfo)(nil),                 // 29: temporal.server.api.persistence.v1.ReplicationTaskInfo
-	(v1.ReplicationFlowControlCommand)(0),           // 30: temporal.server.api.enums.v1.ReplicationFlowControlCommand
-	(v1.TaskType)(0),                                // 31: temporal.server.api.enums.v1.TaskType
-	(v1.NamespaceOperation)(0),                      // 32: temporal.server.api.enums.v1.NamespaceOperation
-	(*v13.NamespaceInfo)(nil),                       // 33: temporal.api.namespace.v1.NamespaceInfo
-	(*v13.NamespaceConfig)(nil),                     // 34: temporal.api.namespace.v1.NamespaceConfig
-	(*v14.NamespaceReplicationConfig)(nil),          // 35: temporal.api.replication.v1.NamespaceReplicationConfig
-	(*v14.FailoverStatus)(nil),                      // 36: temporal.api.replication.v1.FailoverStatus
-	(*v12.NamespaceRestoreInfo)(nil),                // 37: temporal.server.api.persistence.v1.NamespaceRestoreInfo
-	(*v11.Payloads)(nil),                            // 38: temporal.api.common.v1.Payloads
-	(*v15.Failure)(nil),                             // 39: temporal.api.failure.v1.Failure
-	(*v16.VersionHistory)(nil),                      // 40: temporal.server.api.history.v1.VersionHistory
-	(*v17.BaseExecutionInfo)(nil),                   // 41: temporal.server.api.workflow.v1.BaseExecutionInfo
-	(*durationpb.Duration)(nil),                     // 42: google.protobuf.Duration
-	(*v16.VersionHistoryItem)(nil),                  // 43: temporal.server.api.history.v1.VersionHistoryItem
-	(*v12.WorkflowMutableState)(nil),                // 44: temporal.server.api.persistence.v1.WorkflowMutableState
-	(*v12.TaskQueueUserData)(nil),                   // 45: temporal.server.api.persistence.v1.TaskQueueUserData
-	(*v12.StateMachineNode)(nil),                    // 46: temporal.server.api.persistence.v1.StateMachineNode
-	(*v12.WorkflowMutableStateMutation)(nil),        // 47: temporal.server.api.persistence.v1.WorkflowMutableStateMutation
+	nil,                                             // 24: temporal.server.api.replication.v1.SyncReplicationState.ActiveNamespaceFailoverVersionsEntry
+	(v1.ReplicationTaskType)(0),                     // 25: temporal.server.api.enums.v1.ReplicationTaskType
+	(*v11.DataBlob)(nil),                            // 26: temporal.api.common.v1.DataBlob
+	(*timestamppb.Timestamp)(nil),                   // 27: google.protobuf.Timestamp
+	(v1.TaskPriority)(0),                            // 28: temporal.server.api.enums.v1.TaskPriority
+	(*v12.VersionedTransition)(nil),                 // 29: temporal.server.api.persistence.v1.VersionedTransition
+	(*v12.ReplicationTaskInfo)(nil),                 // 30: temporal.server.api.persistence.v1.ReplicationTaskInfo
+	(v1.ReplicationFlowControlCommand)(0),           // 31: temporal.server.api.enums.v1.ReplicationFlowControlCommand
+	(v1.TaskType)(0),                                // 32: temporal.server.api.enums.v1.TaskType
+	(v1.NamespaceOperation)(0),                      // 33: temporal.server.api.enums.v1.NamespaceOperation
+	(*v13.NamespaceInfo)(nil),                       // 34: temporal.api.namespace.v1.NamespaceInfo
+	(*v13.NamespaceConfig)(nil),                     // 35: temporal.api.namespace.v1.NamespaceConfig
+	(*v14.NamespaceReplicationConfig)(nil),          // 36: temporal.api.replication.v1.NamespaceReplicationConfig
+	(*v14.FailoverStatus)(nil),                      // 37: temporal.api.replication.v1.FailoverStatus
+	(*v12.NamespaceRestoreInfo)(nil),                // 38: temporal.server.api.persistence.v1.NamespaceRestoreInfo
+	(*v11.Payloads)(nil),                            // 39: temporal.api.common.v1.Payloads
+	(*v15.Failure)(nil),                             // 40: temporal.api.failure.v1.Failure
+	(*v16.VersionHistory)(nil),                      // 41: temporal.server.api.history.v1.VersionHistory
+	(*v17.BaseExecutionInfo)(nil),                   // 42: temporal.server.api.workflow.v1.BaseExecutionInfo
+	(*durationpb.Duration)(nil),                     // 43: google.protobuf.Duration
+	(*v16.VersionHistoryItem)(nil),                  // 44: temporal.server.api.history.v1.VersionHistoryItem
+	(*v12.WorkflowMutableState)(nil),                // 45: temporal.server.api.persistence.v1.WorkflowMutableState
+	(*v12.TaskQueueUserData)(nil),                   // 46: temporal.server.api.persistence.v1.TaskQueueUserData
+	(*v12.StateMachineNode)(nil),                    // 47: temporal.server.api.persistence.v1.StateMachineNode
+	(*v12.WorkflowMutableStateMutation)(nil),        // 48: temporal.server.api.persistence.v1.WorkflowMutableStateMutation
 }
 var file_temporal_server_api_replication_v1_message_proto_depIdxs = []int32{
-	24, // 0: temporal.server.api.replication.v1.ReplicationTask.task_type:type_name -> temporal.server.api.enums.v1.ReplicationTaskType
+	25, // 0: temporal.server.api.replication.v1.ReplicationTask.task_type:type_name -> temporal.server.api.enums.v1.ReplicationTaskType
 	8,  // 1: temporal.server.api.replication.v1.ReplicationTask.namespace_task_attributes:type_name -> temporal.server.api.replication.v1.NamespaceTaskAttributes
 	9,  // 2: temporal.server.api.replication.v1.ReplicationTask.sync_shard_status_task_attributes:type_name -> temporal.server.api.replication.v1.SyncShardStatusTaskAttributes
 	10, // 3: temporal.server.api.replication.v1.ReplicationTask.sync_activity_task_attributes:type_name -> temporal.server.api.replication.v1.SyncActivityTaskAttributes
@@ -2453,72 +2469,73 @@ var file_temporal_server_api_replication_v1_message_proto_depIdxs = []int32{
 	15, // 8: temporal.server.api.replication.v1.ReplicationTask.backfill_history_task_attributes:type_name -> temporal.server.api.replication.v1.BackfillHistoryTaskAttributes
 	19, // 9: temporal.server.api.replication.v1.ReplicationTask.verify_versioned_transition_task_attributes:type_name -> temporal.server.api.replication.v1.VerifyVersionedTransitionTaskAttributes
 	20, // 10: temporal.server.api.replication.v1.ReplicationTask.sync_versioned_transition_task_attributes:type_name -> temporal.server.api.replication.v1.SyncVersionedTransitionTaskAttributes
-	25, // 11: temporal.server.api.replication.v1.ReplicationTask.data:type_name -> temporal.api.common.v1.DataBlob
-	26, // 12: temporal.server.api.replication.v1.ReplicationTask.visibility_time:type_name -> google.protobuf.Timestamp
-	27, // 13: temporal.server.api.replication.v1.ReplicationTask.priority:type_name -> temporal.server.api.enums.v1.TaskPriority
-	28, // 14: temporal.server.api.replication.v1.ReplicationTask.versioned_transition:type_name -> temporal.server.api.persistence.v1.VersionedTransition
-	29, // 15: temporal.server.api.replication.v1.ReplicationTask.raw_task_info:type_name -> temporal.server.api.persistence.v1.ReplicationTaskInfo
-	26, // 16: temporal.server.api.replication.v1.ReplicationToken.last_processed_visibility_time:type_name -> google.protobuf.Timestamp
-	26, // 17: temporal.server.api.replication.v1.SyncShardStatus.status_time:type_name -> google.protobuf.Timestamp
-	26, // 18: temporal.server.api.replication.v1.SyncReplicationState.inclusive_low_watermark_time:type_name -> google.protobuf.Timestamp
+	26, // 11: temporal.server.api.replication.v1.ReplicationTask.data:type_name -> temporal.api.common.v1.DataBlob
+	27, // 12: temporal.server.api.replication.v1.ReplicationTask.visibility_time:type_name -> google.protobuf.Timestamp
+	28, // 13: temporal.server.api.replication.v1.ReplicationTask.priority:type_name -> temporal.server.api.enums.v1.TaskPriority
+	29, // 14: temporal.server.api.replication.v1.ReplicationTask.versioned_transition:type_name -> temporal.server.api.persistence.v1.VersionedTransition
+	30, // 15: temporal.server.api.replication.v1.ReplicationTask.raw_task_info:type_name -> temporal.server.api.persistence.v1.ReplicationTaskInfo
+	27, // 16: temporal.server.api.replication.v1.ReplicationToken.last_processed_visibility_time:type_name -> google.protobuf.Timestamp
+	27, // 17: temporal.server.api.replication.v1.SyncShardStatus.status_time:type_name -> google.protobuf.Timestamp
+	27, // 18: temporal.server.api.replication.v1.SyncReplicationState.inclusive_low_watermark_time:type_name -> google.protobuf.Timestamp
 	4,  // 19: temporal.server.api.replication.v1.SyncReplicationState.high_priority_state:type_name -> temporal.server.api.replication.v1.ReplicationState
 	4,  // 20: temporal.server.api.replication.v1.SyncReplicationState.low_priority_state:type_name -> temporal.server.api.replication.v1.ReplicationState
 	23, // 21: temporal.server.api.replication.v1.SyncReplicationState.isolated_lane_states:type_name -> temporal.server.api.replication.v1.SyncReplicationState.IsolatedLaneStatesEntry
-	26, // 22: temporal.server.api.replication.v1.ReplicationState.inclusive_low_watermark_time:type_name -> google.protobuf.Timestamp
-	30, // 23: temporal.server.api.replication.v1.ReplicationState.flow_control_command:type_name -> temporal.server.api.enums.v1.ReplicationFlowControlCommand
-	0,  // 24: temporal.server.api.replication.v1.ReplicationMessages.replication_tasks:type_name -> temporal.server.api.replication.v1.ReplicationTask
-	2,  // 25: temporal.server.api.replication.v1.ReplicationMessages.sync_shard_status:type_name -> temporal.server.api.replication.v1.SyncShardStatus
-	0,  // 26: temporal.server.api.replication.v1.WorkflowReplicationMessages.replication_tasks:type_name -> temporal.server.api.replication.v1.ReplicationTask
-	26, // 27: temporal.server.api.replication.v1.WorkflowReplicationMessages.exclusive_high_watermark_time:type_name -> google.protobuf.Timestamp
-	27, // 28: temporal.server.api.replication.v1.WorkflowReplicationMessages.priority:type_name -> temporal.server.api.enums.v1.TaskPriority
-	31, // 29: temporal.server.api.replication.v1.ReplicationTaskInfo.task_type:type_name -> temporal.server.api.enums.v1.TaskType
-	27, // 30: temporal.server.api.replication.v1.ReplicationTaskInfo.priority:type_name -> temporal.server.api.enums.v1.TaskPriority
-	32, // 31: temporal.server.api.replication.v1.NamespaceTaskAttributes.namespace_operation:type_name -> temporal.server.api.enums.v1.NamespaceOperation
-	33, // 32: temporal.server.api.replication.v1.NamespaceTaskAttributes.info:type_name -> temporal.api.namespace.v1.NamespaceInfo
-	34, // 33: temporal.server.api.replication.v1.NamespaceTaskAttributes.config:type_name -> temporal.api.namespace.v1.NamespaceConfig
-	35, // 34: temporal.server.api.replication.v1.NamespaceTaskAttributes.replication_config:type_name -> temporal.api.replication.v1.NamespaceReplicationConfig
-	36, // 35: temporal.server.api.replication.v1.NamespaceTaskAttributes.failover_history:type_name -> temporal.api.replication.v1.FailoverStatus
-	37, // 36: temporal.server.api.replication.v1.NamespaceTaskAttributes.restore_info:type_name -> temporal.server.api.persistence.v1.NamespaceRestoreInfo
-	26, // 37: temporal.server.api.replication.v1.SyncShardStatusTaskAttributes.status_time:type_name -> google.protobuf.Timestamp
-	26, // 38: temporal.server.api.replication.v1.SyncActivityTaskAttributes.scheduled_time:type_name -> google.protobuf.Timestamp
-	26, // 39: temporal.server.api.replication.v1.SyncActivityTaskAttributes.started_time:type_name -> google.protobuf.Timestamp
-	26, // 40: temporal.server.api.replication.v1.SyncActivityTaskAttributes.last_heartbeat_time:type_name -> google.protobuf.Timestamp
-	38, // 41: temporal.server.api.replication.v1.SyncActivityTaskAttributes.details:type_name -> temporal.api.common.v1.Payloads
-	39, // 42: temporal.server.api.replication.v1.SyncActivityTaskAttributes.last_failure:type_name -> temporal.api.failure.v1.Failure
-	40, // 43: temporal.server.api.replication.v1.SyncActivityTaskAttributes.version_history:type_name -> temporal.server.api.history.v1.VersionHistory
-	41, // 44: temporal.server.api.replication.v1.SyncActivityTaskAttributes.base_execution_info:type_name -> temporal.server.api.workflow.v1.BaseExecutionInfo
-	26, // 45: temporal.server.api.replication.v1.SyncActivityTaskAttributes.first_scheduled_time:type_name -> google.protobuf.Timestamp
-	26, // 46: temporal.server.api.replication.v1.SyncActivityTaskAttributes.last_attempt_complete_time:type_name -> google.protobuf.Timestamp
-	42, // 47: temporal.server.api.replication.v1.SyncActivityTaskAttributes.retry_initial_interval:type_name -> google.protobuf.Duration
-	42, // 48: temporal.server.api.replication.v1.SyncActivityTaskAttributes.retry_maximum_interval:type_name -> google.protobuf.Duration
-	43, // 49: temporal.server.api.replication.v1.HistoryTaskAttributes.version_history_items:type_name -> temporal.server.api.history.v1.VersionHistoryItem
-	25, // 50: temporal.server.api.replication.v1.HistoryTaskAttributes.events:type_name -> temporal.api.common.v1.DataBlob
-	25, // 51: temporal.server.api.replication.v1.HistoryTaskAttributes.new_run_events:type_name -> temporal.api.common.v1.DataBlob
-	41, // 52: temporal.server.api.replication.v1.HistoryTaskAttributes.base_execution_info:type_name -> temporal.server.api.workflow.v1.BaseExecutionInfo
-	25, // 53: temporal.server.api.replication.v1.HistoryTaskAttributes.events_batches:type_name -> temporal.api.common.v1.DataBlob
-	44, // 54: temporal.server.api.replication.v1.SyncWorkflowStateTaskAttributes.workflow_state:type_name -> temporal.server.api.persistence.v1.WorkflowMutableState
-	45, // 55: temporal.server.api.replication.v1.TaskQueueUserDataAttributes.user_data:type_name -> temporal.server.api.persistence.v1.TaskQueueUserData
-	40, // 56: temporal.server.api.replication.v1.SyncHSMAttributes.version_history:type_name -> temporal.server.api.history.v1.VersionHistory
-	46, // 57: temporal.server.api.replication.v1.SyncHSMAttributes.state_machine_node:type_name -> temporal.server.api.persistence.v1.StateMachineNode
-	43, // 58: temporal.server.api.replication.v1.BackfillHistoryTaskAttributes.event_version_history:type_name -> temporal.server.api.history.v1.VersionHistoryItem
-	25, // 59: temporal.server.api.replication.v1.BackfillHistoryTaskAttributes.event_batches:type_name -> temporal.api.common.v1.DataBlob
-	16, // 60: temporal.server.api.replication.v1.BackfillHistoryTaskAttributes.new_run_info:type_name -> temporal.server.api.replication.v1.NewRunInfo
-	25, // 61: temporal.server.api.replication.v1.NewRunInfo.event_batch:type_name -> temporal.api.common.v1.DataBlob
-	28, // 62: temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributes.exclusive_start_versioned_transition:type_name -> temporal.server.api.persistence.v1.VersionedTransition
-	47, // 63: temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributes.state_mutation:type_name -> temporal.server.api.persistence.v1.WorkflowMutableStateMutation
-	44, // 64: temporal.server.api.replication.v1.SyncWorkflowStateSnapshotAttributes.state:type_name -> temporal.server.api.persistence.v1.WorkflowMutableState
-	43, // 65: temporal.server.api.replication.v1.VerifyVersionedTransitionTaskAttributes.event_version_history:type_name -> temporal.server.api.history.v1.VersionHistoryItem
-	21, // 66: temporal.server.api.replication.v1.SyncVersionedTransitionTaskAttributes.versioned_transition_artifact:type_name -> temporal.server.api.replication.v1.VersionedTransitionArtifact
-	17, // 67: temporal.server.api.replication.v1.VersionedTransitionArtifact.sync_workflow_state_mutation_attributes:type_name -> temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributes
-	18, // 68: temporal.server.api.replication.v1.VersionedTransitionArtifact.sync_workflow_state_snapshot_attributes:type_name -> temporal.server.api.replication.v1.SyncWorkflowStateSnapshotAttributes
-	25, // 69: temporal.server.api.replication.v1.VersionedTransitionArtifact.event_batches:type_name -> temporal.api.common.v1.DataBlob
-	16, // 70: temporal.server.api.replication.v1.VersionedTransitionArtifact.new_run_info:type_name -> temporal.server.api.replication.v1.NewRunInfo
-	4,  // 71: temporal.server.api.replication.v1.SyncReplicationState.IsolatedLaneStatesEntry.value:type_name -> temporal.server.api.replication.v1.ReplicationState
-	72, // [72:72] is the sub-list for method output_type
-	72, // [72:72] is the sub-list for method input_type
-	72, // [72:72] is the sub-list for extension type_name
-	72, // [72:72] is the sub-list for extension extendee
-	0,  // [0:72] is the sub-list for field type_name
+	24, // 22: temporal.server.api.replication.v1.SyncReplicationState.active_namespace_failover_versions:type_name -> temporal.server.api.replication.v1.SyncReplicationState.ActiveNamespaceFailoverVersionsEntry
+	27, // 23: temporal.server.api.replication.v1.ReplicationState.inclusive_low_watermark_time:type_name -> google.protobuf.Timestamp
+	31, // 24: temporal.server.api.replication.v1.ReplicationState.flow_control_command:type_name -> temporal.server.api.enums.v1.ReplicationFlowControlCommand
+	0,  // 25: temporal.server.api.replication.v1.ReplicationMessages.replication_tasks:type_name -> temporal.server.api.replication.v1.ReplicationTask
+	2,  // 26: temporal.server.api.replication.v1.ReplicationMessages.sync_shard_status:type_name -> temporal.server.api.replication.v1.SyncShardStatus
+	0,  // 27: temporal.server.api.replication.v1.WorkflowReplicationMessages.replication_tasks:type_name -> temporal.server.api.replication.v1.ReplicationTask
+	27, // 28: temporal.server.api.replication.v1.WorkflowReplicationMessages.exclusive_high_watermark_time:type_name -> google.protobuf.Timestamp
+	28, // 29: temporal.server.api.replication.v1.WorkflowReplicationMessages.priority:type_name -> temporal.server.api.enums.v1.TaskPriority
+	32, // 30: temporal.server.api.replication.v1.ReplicationTaskInfo.task_type:type_name -> temporal.server.api.enums.v1.TaskType
+	28, // 31: temporal.server.api.replication.v1.ReplicationTaskInfo.priority:type_name -> temporal.server.api.enums.v1.TaskPriority
+	33, // 32: temporal.server.api.replication.v1.NamespaceTaskAttributes.namespace_operation:type_name -> temporal.server.api.enums.v1.NamespaceOperation
+	34, // 33: temporal.server.api.replication.v1.NamespaceTaskAttributes.info:type_name -> temporal.api.namespace.v1.NamespaceInfo
+	35, // 34: temporal.server.api.replication.v1.NamespaceTaskAttributes.config:type_name -> temporal.api.namespace.v1.NamespaceConfig
+	36, // 35: temporal.server.api.replication.v1.NamespaceTaskAttributes.replication_config:type_name -> temporal.api.replication.v1.NamespaceReplicationConfig
+	37, // 36: temporal.server.api.replication.v1.NamespaceTaskAttributes.failover_history:type_name -> temporal.api.replication.v1.FailoverStatus
+	38, // 37: temporal.server.api.replication.v1.NamespaceTaskAttributes.restore_info:type_name -> temporal.server.api.persistence.v1.NamespaceRestoreInfo
+	27, // 38: temporal.server.api.replication.v1.SyncShardStatusTaskAttributes.status_time:type_name -> google.protobuf.Timestamp
+	27, // 39: temporal.server.api.replication.v1.SyncActivityTaskAttributes.scheduled_time:type_name -> google.protobuf.Timestamp
+	27, // 40: temporal.server.api.replication.v1.SyncActivityTaskAttributes.started_time:type_name -> google.protobuf.Timestamp
+	27, // 41: temporal.server.api.replication.v1.SyncActivityTaskAttributes.last_heartbeat_time:type_name -> google.protobuf.Timestamp
+	39, // 42: temporal.server.api.replication.v1.SyncActivityTaskAttributes.details:type_name -> temporal.api.common.v1.Payloads
+	40, // 43: temporal.server.api.replication.v1.SyncActivityTaskAttributes.last_failure:type_name -> temporal.api.failure.v1.Failure
+	41, // 44: temporal.server.api.replication.v1.SyncActivityTaskAttributes.version_history:type_name -> temporal.server.api.history.v1.VersionHistory
+	42, // 45: temporal.server.api.replication.v1.SyncActivityTaskAttributes.base_execution_info:type_name -> temporal.server.api.workflow.v1.BaseExecutionInfo
+	27, // 46: temporal.server.api.replication.v1.SyncActivityTaskAttributes.first_scheduled_time:type_name -> google.protobuf.Timestamp
+	27, // 47: temporal.server.api.replication.v1.SyncActivityTaskAttributes.last_attempt_complete_time:type_name -> google.protobuf.Timestamp
+	43, // 48: temporal.server.api.replication.v1.SyncActivityTaskAttributes.retry_initial_interval:type_name -> google.protobuf.Duration
+	43, // 49: temporal.server.api.replication.v1.SyncActivityTaskAttributes.retry_maximum_interval:type_name -> google.protobuf.Duration
+	44, // 50: temporal.server.api.replication.v1.HistoryTaskAttributes.version_history_items:type_name -> temporal.server.api.history.v1.VersionHistoryItem
+	26, // 51: temporal.server.api.replication.v1.HistoryTaskAttributes.events:type_name -> temporal.api.common.v1.DataBlob
+	26, // 52: temporal.server.api.replication.v1.HistoryTaskAttributes.new_run_events:type_name -> temporal.api.common.v1.DataBlob
+	42, // 53: temporal.server.api.replication.v1.HistoryTaskAttributes.base_execution_info:type_name -> temporal.server.api.workflow.v1.BaseExecutionInfo
+	26, // 54: temporal.server.api.replication.v1.HistoryTaskAttributes.events_batches:type_name -> temporal.api.common.v1.DataBlob
+	45, // 55: temporal.server.api.replication.v1.SyncWorkflowStateTaskAttributes.workflow_state:type_name -> temporal.server.api.persistence.v1.WorkflowMutableState
+	46, // 56: temporal.server.api.replication.v1.TaskQueueUserDataAttributes.user_data:type_name -> temporal.server.api.persistence.v1.TaskQueueUserData
+	41, // 57: temporal.server.api.replication.v1.SyncHSMAttributes.version_history:type_name -> temporal.server.api.history.v1.VersionHistory
+	47, // 58: temporal.server.api.replication.v1.SyncHSMAttributes.state_machine_node:type_name -> temporal.server.api.persistence.v1.StateMachineNode
+	44, // 59: temporal.server.api.replication.v1.BackfillHistoryTaskAttributes.event_version_history:type_name -> temporal.server.api.history.v1.VersionHistoryItem
+	26, // 60: temporal.server.api.replication.v1.BackfillHistoryTaskAttributes.event_batches:type_name -> temporal.api.common.v1.DataBlob
+	16, // 61: temporal.server.api.replication.v1.BackfillHistoryTaskAttributes.new_run_info:type_name -> temporal.server.api.replication.v1.NewRunInfo
+	26, // 62: temporal.server.api.replication.v1.NewRunInfo.event_batch:type_name -> temporal.api.common.v1.DataBlob
+	29, // 63: temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributes.exclusive_start_versioned_transition:type_name -> temporal.server.api.persistence.v1.VersionedTransition
+	48, // 64: temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributes.state_mutation:type_name -> temporal.server.api.persistence.v1.WorkflowMutableStateMutation
+	45, // 65: temporal.server.api.replication.v1.SyncWorkflowStateSnapshotAttributes.state:type_name -> temporal.server.api.persistence.v1.WorkflowMutableState
+	44, // 66: temporal.server.api.replication.v1.VerifyVersionedTransitionTaskAttributes.event_version_history:type_name -> temporal.server.api.history.v1.VersionHistoryItem
+	21, // 67: temporal.server.api.replication.v1.SyncVersionedTransitionTaskAttributes.versioned_transition_artifact:type_name -> temporal.server.api.replication.v1.VersionedTransitionArtifact
+	17, // 68: temporal.server.api.replication.v1.VersionedTransitionArtifact.sync_workflow_state_mutation_attributes:type_name -> temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributes
+	18, // 69: temporal.server.api.replication.v1.VersionedTransitionArtifact.sync_workflow_state_snapshot_attributes:type_name -> temporal.server.api.replication.v1.SyncWorkflowStateSnapshotAttributes
+	26, // 70: temporal.server.api.replication.v1.VersionedTransitionArtifact.event_batches:type_name -> temporal.api.common.v1.DataBlob
+	16, // 71: temporal.server.api.replication.v1.VersionedTransitionArtifact.new_run_info:type_name -> temporal.server.api.replication.v1.NewRunInfo
+	4,  // 72: temporal.server.api.replication.v1.SyncReplicationState.IsolatedLaneStatesEntry.value:type_name -> temporal.server.api.replication.v1.ReplicationState
+	73, // [73:73] is the sub-list for method output_type
+	73, // [73:73] is the sub-list for method input_type
+	73, // [73:73] is the sub-list for extension type_name
+	73, // [73:73] is the sub-list for extension extendee
+	0,  // [0:73] is the sub-list for field type_name
 }
 
 func init() { file_temporal_server_api_replication_v1_message_proto_init() }
@@ -2548,7 +2565,7 @@ func file_temporal_server_api_replication_v1_message_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_temporal_server_api_replication_v1_message_proto_rawDesc), len(file_temporal_server_api_replication_v1_message_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   24,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

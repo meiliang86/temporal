@@ -174,6 +174,10 @@ type (
 		CurrentTime                time.Time
 		AckedReplicationTaskIDs    map[int32]int64
 		AckedReplicationTimestamps map[int32]time.Time
+		// FencedNamespaceFailoverVersions holds, per remote shard, the highest failover version at
+		// which that remote shard reported it is active for a sync replication namespace (keyed by
+		// namespace ID). Its acks don't count toward writes made under an older failover version.
+		FencedNamespaceFailoverVersions map[int32]map[string]int64
 	}
 
 	namespaceHandOverInfo struct {
@@ -461,29 +465,86 @@ func (s *ContextImpl) UpdateRemoteReaderInfo(
 	return nil
 }
 
-// WaitForReplicationCommit blocks until each of the given remote clusters has acknowledged applying
+// UpdateRemoteReaderFencing records the fencing notice of a remote shard: the failover version at
+// which it is active for each listed namespace. Versions only grow. Must be called before the ack
+// carrying the notice advances the remote reader's watermark.
+func (s *ContextImpl) UpdateRemoteReaderFencing(
+	readerID int64,
+	activeNamespaceFailoverVersions map[string]int64,
+) error {
+	if len(activeNamespaceFailoverVersions) == 0 {
+		return nil
+	}
+	clusterID, shardID := ReplicationReaderIDToClusterShardID(readerID)
+	clusterName, _, ok := clusterNameInfoFromClusterID(s.clusterMetadata.GetAllClusterInfo(), clusterID)
+	if !ok {
+		return serviceerror.NewInternalf("unknown cluster ID: %v", clusterID)
+	}
+
+	s.wLock()
+	defer s.wUnlock()
+
+	remoteClusterInfo := s.getOrUpdateRemoteClusterInfoLocked(clusterName)
+	fences, ok := remoteClusterInfo.FencedNamespaceFailoverVersions[shardID]
+	if !ok {
+		fences = make(map[string]int64, len(activeNamespaceFailoverVersions))
+		remoteClusterInfo.FencedNamespaceFailoverVersions[shardID] = fences
+	}
+	changed := false
+	for namespaceID, version := range activeNamespaceFailoverVersions {
+		if version > fences[namespaceID] {
+			fences[namespaceID] = version
+			changed = true
+		}
+	}
+	if changed {
+		s.notifyReplicationAckLocked()
+	}
+	return nil
+}
+
+// syncReplicationRecheckInterval bounds how long WaitForReplicationCommit takes to notice that the
+// set of clusters it waits for changed (the namespace registry doesn't notify the shard).
+const syncReplicationRecheckInterval = 200 * time.Millisecond
+
+// WaitForReplicationCommit blocks until each cluster returned by clusters has acknowledged applying
 // every replication task of this shard with ID <= taskID, or until ctx is done or the shard stops.
 // When a remote cluster has a different shard count, this shard streams to several of its shards,
-// and all of them must have acknowledged.
+// and all of them must have acknowledged. clusters is evaluated again on every acknowledgement and
+// periodically, so a change of the membership the control plane set takes effect for pending writes.
+//
+// Fencing: the transaction was written under failoverVersion of namespaceID. If a remote shard that
+// must acknowledge it reported being active for the namespace at a newer failover version, its acks
+// can't confirm the transaction (it may have ignored the transaction's tasks as a stale branch). The
+// wait then fails right away and returns that cluster's name.
 func (s *ContextImpl) WaitForReplicationCommit(
 	ctx context.Context,
-	clusters []string,
+	namespaceID string,
+	failoverVersion int64,
 	taskID int64,
-) error {
+	clusters func() []string,
+) (fencedBy string, retErr error) {
+	ticker := time.NewTicker(syncReplicationRecheckInterval)
+	defer ticker.Stop()
 	for {
+		waitFor := clusters()
 		s.rLock()
-		committed := s.isReplicationCommittedLocked(clusters, taskID)
+		committed, fencedBy := s.replicationCommitStatusLocked(waitFor, namespaceID, failoverVersion, taskID)
 		notifyCh := s.replicationAckNotifyCh
 		s.rUnlock()
+		if fencedBy != "" {
+			return fencedBy, nil
+		}
 		if committed {
-			return nil
+			return "", nil
 		}
 		select {
 		case <-notifyCh:
+		case <-ticker.C:
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		case <-s.lifecycleCtx.Done():
-			return s.lifecycleCtx.Err()
+			return "", s.lifecycleCtx.Err()
 		}
 	}
 }
@@ -506,26 +567,40 @@ func (s *ContextImpl) SyncReplicationBarrier() int64 {
 	return s.syncReplicationBarrier.Load()
 }
 
-func (s *ContextImpl) isReplicationCommittedLocked(clusters []string, taskID int64) bool {
+// replicationCommitStatusLocked reports whether every given remote cluster acknowledged every
+// replication task with ID <= taskID, or which of them fenced a write of namespaceID made under
+// failoverVersion.
+func (s *ContextImpl) replicationCommitStatusLocked(
+	clusters []string,
+	namespaceID string,
+	failoverVersion int64,
+	taskID int64,
+) (committed bool, fencedBy string) {
 	allClusterInfo := s.clusterMetadata.GetAllClusterInfo()
 	localShardCount := allClusterInfo[s.clusterMetadata.GetCurrentClusterName()].ShardCount
+	committed = true
 	for _, clusterName := range clusters {
-		info, ok := s.remoteClusterInfos[clusterName]
-		if !ok {
-			return false
-		}
 		remoteCluster, ok := allClusterInfo[clusterName]
 		if !ok {
-			return false
+			committed = false
+			continue
+		}
+		info, ok := s.remoteClusterInfos[clusterName]
+		if !ok {
+			committed = false
+			continue
 		}
 		for _, remoteShardID := range common.MapShardID(localShardCount, remoteCluster.ShardCount, s.shardID) {
+			if info.FencedNamespaceFailoverVersions[remoteShardID][namespaceID] > failoverVersion {
+				return false, clusterName
+			}
 			acked, ok := info.AckedReplicationTaskIDs[remoteShardID]
 			if !ok || acked < taskID {
-				return false
+				committed = false
 			}
 		}
 	}
-	return true
+	return committed, ""
 }
 
 func (s *ContextImpl) notifyReplicationAckLocked() {
@@ -2193,16 +2268,21 @@ func (s *ContextImpl) GetReplicationStatus(clusterNames []string) (map[string]*h
 			if ackTimestamp.IsZero() {
 				ackTimestamp = time.Unix(0, 0)
 			}
-			if record, ok := remoteClusters[clusterName]; !ok {
-				remoteClusters[clusterName] = &historyservice.ShardReplicationStatusPerCluster{
-					AckedTaskId:             ackTaskID,
-					AckedTaskVisibilityTime: timestamppb.New(ackTimestamp),
+			record, ok := remoteClusters[clusterName]
+			if !ok || record.AckedTaskId > ackTaskID {
+				fences := record.GetFencedNamespaceFailoverVersions()
+				record = &historyservice.ShardReplicationStatusPerCluster{
+					AckedTaskId:                     ackTaskID,
+					AckedTaskVisibilityTime:         timestamppb.New(ackTimestamp),
+					FencedNamespaceFailoverVersions: fences,
 				}
-			} else if record.AckedTaskId > ackTaskID {
-				remoteClusters[clusterName] = &historyservice.ShardReplicationStatusPerCluster{
-					AckedTaskId:             ackTaskID,
-					AckedTaskVisibilityTime: timestamppb.New(ackTimestamp),
+				remoteClusters[clusterName] = record
+			}
+			for namespaceID, version := range v.FencedNamespaceFailoverVersions[remoteShardID] {
+				if record.FencedNamespaceFailoverVersions == nil {
+					record.FencedNamespaceFailoverVersions = make(map[string]int64)
 				}
+				record.FencedNamespaceFailoverVersions[namespaceID] = max(record.FencedNamespaceFailoverVersions[namespaceID], version)
 			}
 		}
 	}
@@ -2217,8 +2297,9 @@ func (s *ContextImpl) getOrUpdateRemoteClusterInfoLocked(clusterName string) *re
 		return info
 	}
 	info := &remoteClusterInfo{
-		AckedReplicationTaskIDs:    make(map[int32]int64),
-		AckedReplicationTimestamps: make(map[int32]time.Time),
+		AckedReplicationTaskIDs:         make(map[int32]int64),
+		AckedReplicationTimestamps:      make(map[int32]time.Time),
+		FencedNamespaceFailoverVersions: make(map[int32]map[string]int64),
 	}
 	s.remoteClusterInfos[clusterName] = info
 	return info
