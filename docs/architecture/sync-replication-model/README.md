@@ -1,7 +1,13 @@
 # Model check of the v1 two-cluster failover protocol
 
-`model.py` is an exhaustive explicit-state model checker for the protocol in
-`../sync-replication-design.md` ("v1 failover"). Within the bounds, it explores every interleaving of
+Two equivalent models of the protocol in `../sync-replication-design.md` ("v1 failover"):
+
+- `SyncReplication.tla`: TLA+ spec, checked with TLC (`run_tlc.sh <writes> <failovers> [mutation]`, with `TLA2TOOLS` pointing at `tla2tools.jar` 1.8.0).
+- `model.py`: an exhaustive explicit-state checker in Python, written first, that mirrors the spec action for action.
+
+For the same bounds both report exactly the same number of distinct states (560,248 at 2 writes and 1 failover; TLC: 4,550,477 states generated, Python: 4,550,476 transitions plus the initial state). So the two encodings agree.
+
+`model.py` is an exhaustive explicit-state model checker for the same protocol. Within the bounds, it explores every interleaving of
 writes, commits, reads, replication, acks (including lost and late ones), namespace propagation, planned
 and forced failovers and control-plane membership changes, and checks the safety invariants in every
 reachable state. This is what TLC does for a TLA+ spec on a bounded model. It is not a proof for unbounded
@@ -47,7 +53,9 @@ Run: `python3 model.py --max-writes 3 --max-failovers 2 [--fingerprint] [--mutat
 | 3 writes, 1 failover | OK: 4,754,592 states, 39.9M transitions |
 | 3 writes, 2 failovers | see below |
 
-Each mutation breaks one rule. The checker finds a violation for every one (2 writes, 2 failovers):
+Both TLC and `model.py` agree on every row above.
+
+Each mutation breaks one rule. Both TLC and `model.py` find a violation for every one (2 writes, 2 failovers):
 
 | Mutation | Counterexample |
 |---|---|
