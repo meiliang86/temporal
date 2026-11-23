@@ -21,24 +21,86 @@ Two more options sit on top of this:
 
 ## v1 decisions
 
-Agreed scope for the first implementation. Later sections describe the full design. Where they differ, this list wins for v1.
+Agreed scope for the first implementation. Later sections describe the full design. Where they differ, this list and the "v1 failover" section below win for v1.
+
+- **Two clusters, full quorum.** Sync mode is refused for namespaces replicated to more than two clusters. With three clusters, full quorum adds latency without riding out a single failure; three clusters will come later with majority quorum (§4.3–4.4). The v1 design keeps the extension points listed in "v1 failover".
 
 - **Everything is sync.** For a sync namespace, every transaction waits for quorum: a fixed sync policy of "all". Per-event-type triggers (§3.6) are deferred. The config shape and the per-transaction classification hook are kept so they can be added later without a migration. Effects for v1:
   - every transaction stamps and persists the barrier,
   - no async transactions in a sync namespace,
-  - no mixed rollback: every uncommitted transaction on a returning old active is discarded, and NDC event reapply is turned off for sync namespaces.
+  - no mixed per-transaction classification.
 - **Namespace-level only.** Sync mode is refused for namespaces whose active cluster is resolved per business ID or routing key. Epoch, in-sync set, lease and fencing are all per namespace.
 - **Strong consistency on the workflow.** A pending sync write blocks all access to that workflow (§3.3), reads included.
 - **A quorum-wait timeout returns `Unavailable`.** A retry must return the original result. That requires:
   - the duplicate-request check waits on the same commit through the gate,
   - every duplicate-detection key lives in replicated mutable state (audit required),
-  - an uncommitted write discarded at failover executes fresh on the new active.
-- **Rollback is per workflow.** A pending sync write blocks everything behind it, so each workflow's uncommitted tail on the old active is well defined. With everything sync, the whole tail is uncommitted sync writes, and it is discarded.
+  - a retry that lands on the new active after a failover is deduplicated there if the original write reached it.
+- **Uncommitted writes of an old active are kept, not discarded** (superseded the earlier "discard" decision). A write that never committed was never reported as successful (the client got `Unavailable`, a timeout, or nothing), so its outcome is unknown and it may take effect late. When the old active returns, its leftover replication tasks apply as today, and NDC event reapply stays on. Discarding them is a possible later refinement (see "v1 failover").
 - **One ack watermark (no durable-watermark work).** v1 counts the existing progress watermark as the commit ack. A task that goes to the replication DLQ still advances it, so a write can be treated as committed while that standby is missing it. If the standby is then promoted, that write is lost.
   - **Mitigation:** any replication DLQ entry for a sync namespace is a page-level alert. The DLQ'd workflows are re-replicated before that standby is eligible for a clean promote.
   - The proper fix is logged as future work (§10).
-- **The control plane is push-only.** It calls the data plane: `ApplyReplicationGroupState` for decisions and lease renewals, plus health, lag and applied-version reads. The data plane never calls the control plane.
+- **The control plane is push-only.** It calls the data plane: existing failover APIs, `UpdateSyncReplicationState` for the in-sync set and lease renewals, and `GetSyncReplicationStatus` for health, lag and drain state. The data plane never calls the control plane.
 - **Failure detection is external.** The failure detector and the control plane make all membership and failover decisions, including human overrides, through the control plane's serialized record (§5.3–5.4). The data plane keeps only local safety reflexes: stop when the lease expires, demote when fenced, return `Unavailable` on a quorum-wait timeout.
+
+## v1 failover (two clusters)
+
+Builds on Temporal's existing failover. It supersedes §4–5 where they differ for v1.
+
+### Model
+
+- **Leader and term are the namespace's existing active cluster and failover version.** Failover itself uses the existing APIs: the `namespace-handover` workflow for planned failover, and `UpdateNamespace(ActiveClusterName)` for forced failover.
+- **The only new per-namespace state is the in-sync set**, pushed by the control plane and stored as a local, never-replicated field of the namespace metadata:
+  - `in_sync_clusters`,
+  - `required_acks` (1 for two clusters; also 1 for three-cluster majority later),
+  - `lease_expiry` (used only when the in-sync set is the active cluster alone),
+  - `version` (stale or duplicate pushes are ignored).
+- **Commit rule:** a write commits when `required_acks` members of the in-sync set other than the active have acknowledged it. With in-sync = {active} (degraded), it commits locally, but only while the lease is valid. After expiry, writes stay hidden and callers get `Unavailable`.
+- **Fencing notice:** once a cluster is active for namespace N at failover version v, every replication ack it sends to another cluster carries "N is at v". That cluster then stops counting those acks for N, fails pending commits immediately, and rejects new writes with `NamespaceNotActive` naming the new active. The notice travels in the same message as the watermark it covers.
+
+### Flows
+
+| Flow | How | New pieces |
+|---|---|---|
+| Planned failover | Existing handover workflow, unchanged | None expected (needs a test) |
+| Standby fails | Control plane pushes in-sync = {A} plus a lease; A commits alone while the lease is renewed | Degraded mode, lease |
+| Forced failover (A down or partitioned) | `UpdateNamespace(active = B)` on B, then in-sync = {B} plus a lease | Fencing notice |
+| Old active returns | A stops writing (fenced); A → B drains to A's fixed end; B → A catches up; two-step rejoin | `drained_to` / `caught_up` status |
+| Failback | Planned failover once A is in sync | None |
+| Forced failover while degraded | Human override after A's lease has expired; degraded-period writes are lost | Lease |
+
+**Why the lease:** in normal mode A can't commit without B, so fencing alone stops a zombie A. While degraded, A commits alone. The lease guarantees that A, if cut off from the control plane, stops acknowledging writes by a known time, and the control plane promotes B only after that time. Cost: a control-plane outage longer than the lease stops writes on a degraded namespace.
+
+**Uncommitted writes of the old active:** kept. They apply on B when A's queue drains, and conflict resolution and event reapply handle workflows B already wrote, as today. "A is in sync again" means both directions are drained (A → B to A's fixed end, B → A caught up) and the rejoin step is complete. The alternative, discarding them, needs corrective tasks from B, a rollback mode in snapshot apply, and reapply off. It is deferred.
+
+### API
+
+- **`UpdateSyncReplicationState`** (admin, new): sets the in-sync set, `required_acks` and lease for one or more namespaces. A lease renewal is the same version with a later expiry.
+- **`GetSyncReplicationStatus`** (admin, new), per namespace:
+  - stored state, and the lowest version applied across shards;
+  - role (active, standby, fenced);
+  - per peer and per shard: acked task ID against the highest replication task ID;
+  - `caught_up(peer)` and `drained_to(peer)`;
+  - as follower, the applied position per source shard.
+- **Reused:** `UpdateNamespace`, the handover workflow, `GetReplicationStatus`.
+- **Internal:** a fencing-notice field on the replication ack message.
+
+### Extension points for three clusters and majority quorum
+
+| Piece | v1 (two clusters) | Majority later |
+|---|---|---|
+| Commit rule | `required_acks` of the in-sync set, value 1 | Same code, in-sync = {A, B, C} |
+| Fencing | Notice keyed by failover version | Same; every follower sends it |
+| Status API | Includes follower applied positions | Used to pick the most up-to-date candidate |
+| Election | Implicit (one follower) | Prepare/promise step before `UpdateNamespace(active)` |
+| Catch-up | Not needed | Follower record of applied writes; pull from the other follower before activating |
+
+### Build order
+
+1. Test planned failover on a sync namespace.
+2. Fencing notice and its handling; test a forced failover with A partitioned.
+3. In-sync state storage and the two admin RPCs (proto changes).
+4. Commit by in-sync set; degraded mode with the lease.
+5. Rejoin status (`caught_up`, `drained_to`); full A → B → A test.
 
 ## 1. How replication works today, mapped to Raft
 
