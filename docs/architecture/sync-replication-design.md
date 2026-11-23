@@ -51,9 +51,9 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 - **Leader and term are the namespace's existing active cluster and failover version.** Failover itself uses the existing APIs: the `namespace-handover` workflow for planned failover, and `UpdateNamespace(ActiveClusterName)` for forced failover.
 - **The only new per-namespace state is the in-sync set**, pushed by the control plane and stored as a local, never-replicated field of the namespace metadata:
   - `in_sync_clusters`,
-  - `required_acks` (1 for two clusters; also 1 for three-cluster majority later),
+  - `joining_clusters` (commits wait for them, but they are not promotable yet: rejoin step 1),
   - `version` (stale or duplicate pushes are ignored).
-- **Commit rule:** a write commits when `required_acks` members of the in-sync set other than the active have acknowledged it. With in-sync = {active} (degraded), it commits locally.
+- **Commit rule:** a write commits when every member of the in-sync and joining sets other than the active has acknowledged it (full quorum; a `required_acks` count comes with majority quorum). With in-sync = {active} and nobody joining (degraded), it commits locally.
 - **Failover only to an in-sync cluster.** Automatic failover (planned or forced) targets only a member of the in-sync set. A double failure (the standby was dropped, then the active fails) leaves the namespace unavailable until the active returns. The plain forced failover remains a manual escape hatch: an operator guarantees the old active is down and accepts losing its degraded-period writes. No lease is needed, because a degraded active is never replaced automatically.
 - **Fencing notice:** once a cluster is active for namespace N at failover version v, every replication ack it sends to another cluster carries "N is at v". The notice travels in the same message as the watermark it covers. The receiving cluster:
   - counts an ack toward a write only if the notice is **not newer than the failover version the write was made under**. The check is per write, not against the receiver's current version; the model checker found the latter unsafe;
@@ -84,21 +84,32 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 
 ### API
 
-- **`UpdateSyncReplicationState`** (admin, new): sets the in-sync set and `required_acks` for one or more namespaces.
-- **`GetSyncReplicationStatus`** (admin, new), per namespace:
-  - stored state, and the lowest version applied across shards (for rejoin step 1);
-  - role (active, standby, fenced) and the failover version this cluster knows;
-  - per peer and per shard: acked task ID against this cluster's highest replication task ID. Queried on both clusters, this gives both drain directions;
-  - `caught_up(peer)` and `drained_to(peer)` precomputed from the above;
-  - as follower, the applied position per source shard (for three-cluster candidate choice later).
-- **Reused:** `UpdateNamespace`, the handover workflow, `GetReplicationStatus`.
-- **Internal:** a fencing-notice field on the replication ack message.
+As implemented on `sync-replication/v1-blocking`:
+
+- **`UpdateSyncReplicationState(namespaces, state)`** (admin, new). `state` is `{version, in_sync_clusters, joining_clusters}`. For each namespace it is stored only if `version` is higher than the stored one. The response reports, per namespace, the stored version and whether this call applied it. Validation:
+  - the namespace is global and has at least two clusters;
+  - `in_sync_clusters` is non-empty;
+  - every listed cluster belongs to the namespace, and none is listed twice. A joining cluster is not in sync yet.
+  - The active cluster need *not* be in sync: after a forced failover the old active must accept the record that drops it.
+- **`GetSyncReplicationStatus(namespace)`** (admin, new):
+  - The stored record. The active cluster and failover version from the namespace metadata.
+  - `min_applied_version`: the lowest record version applied by any history shard (rejoin step 1, and "the push took effect").
+  - `min_known_failover_version`: the lowest failover version any shard sees ("this cluster knows the current failover").
+  - Per peer:
+    - `drained`: the peer acked every shard's sync barrier. On the active, the peer has caught up. On a returning old active, its writes reached the peer.
+    - `fenced_at_failover_version`: the highest version the peer reported being active at.
+    - per-shard barrier and acked task ID.
+  - Returns `Unavailable` if a shard didn't report, rather than a wrong `drained`.
+- **Reused:** `UpdateNamespace`, the handover workflow, and history `GetReplicationStatus`, extended with the per-shard sync barrier, applied record versions, known failover versions and fencing notices.
+- **Internal:** `SyncReplicationState.active_namespace_failover_versions` on the replication ack.
+
+v1 drops `required_acks`: a commit waits for every in-sync and joining member other than the active (full quorum). Majority quorum adds the field later.
 
 ### Extension points for three clusters and majority quorum
 
 | Piece | v1 (two clusters) | Majority later |
 |---|---|---|
-| Commit rule | `required_acks` of the in-sync set, value 1 | Same code, in-sync = {A, B, C} |
+| Commit rule | Every other in-sync or joining member | Add `required_acks` to the record; in-sync = {A, B, C}, `required_acks` = 1 |
 | Fencing | Notice keyed by failover version | Same; every follower sends it |
 | Status API | Includes follower applied positions | Used to pick the most up-to-date candidate |
 | Election | Implicit (one follower) | Prepare/promise step before `UpdateNamespace(active)` |
@@ -108,13 +119,42 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 
 `sync-replication-model/` holds a TLA+ spec (checked with TLC) and an equivalent Python model checker, with results and counterexamples. All invariants hold within the checked bounds. Every deliberately broken variant is caught, including each part of the control-plane rules and the per-write fencing check.
 
-### Build order
+### Implementation (data plane)
 
-1. Test planned failover on a sync namespace.
-2. Fencing notice and its handling (per-write check); test a forced failover with A partitioned.
-3. In-sync state storage and the two admin RPCs (proto changes).
-4. Commit by in-sync set; degraded mode.
-5. Rejoin status (known failover version, both drain directions, applied in-sync version); full A → B → A test.
+Branch `sync-replication/v1-blocking`. The control plane is external; the data plane provides the two admin RPCs above.
+
+- **Commit set:** the record's in-sync and joining clusters, minus this cluster. With no record, every cluster of the namespace (the behavior before failover support). An empty set is degraded mode. The set is re-read from the namespace registry on every ack and every 200 ms while a write waits. A record pushed mid-wait therefore applies to pending writes: a write waiting on a dropped standby commits as soon as the active applies the degraded record.
+- **Whether a write waits** depends on the failover version the write was made under: it waits if that version belongs to this cluster. It does not depend on what the registry says when the wait starts. The prototype checked the registry, and a host that learned of a failover between persisting and waiting would have acknowledged the write unconfirmed.
+- **Fencing:**
+  - The stream receiver attaches, to every ack, the failover version of each sync namespace it is active for. It builds them after the watermark, so they cover the acknowledged tasks.
+  - The sender records them per remote shard before advancing the watermark. Versions only grow.
+  - A write made under version `v` is fenced as soon as any shard it waits on reports a version greater than `v`. The write then fails at once with `NamespaceNotActive`, naming the fencing cluster.
+  - Loading mutable state from the database applies the same check against the namespace's current failover version. So a fenced old active exposes nothing it wrote. After a failback, writes and loads run at a version newer than the fence, which no longer applies.
+- **Drain tracking:** the shard sync barrier is recorded for every active sync write, including degraded-mode writes that don't wait. `drained` compares the peer's ack with it.
+- **Record storage:** written straight to the metadata store, conditioned on the metadata notification version, so a concurrent namespace update fails instead of being lost. Namespace replication neither sends nor overwrites it; a fixture test of the replicated fields guards that.
+
+Known limits:
+
+1. **The fence is conservative.** It is checked when the write is evaluated, against the highest version received so far. During a handover, a write acked just before the new active's first fenced ack could be reported as failed although the new active has it. A retry with the same request ID reaches the new active and finds it.
+2. **The fence comes from the receiving host's namespace registry.** Suppose a standby shard moves to a host whose registry hasn't seen the failover yet, right after the new active wrote on it. That host could ignore an old-active task, as a stale branch, and ack it without a fence. Closing this needs the fence derived from task application (ignored as stale, then report the local version), or a registry refresh on shard acquisition. The window is about the 2 s registry refresh, and it needs a zombie old active that is still connected.
+
+Tests (`tests/xdc/sync_replication_failover_test.go`, two clusters, with and without transition history):
+
+| Test | Covers |
+|---|---|
+| `MembershipRecordIsLocalAndVersioned` | Per-cluster records; stale and duplicate pushes; validation; namespace update, its replication, and failover keep the records |
+| `DegradedModeAndRejoin` | Standby stops applying: writes time out. A write already waiting commits when the record drops the standby. Degraded writes commit alone. Rejoin step 1 blocks again. Catch-up: `drained`, and every write is on the standby. Step 2 |
+| `PlannedFailoverAndFailback` | Handover A → B: B waits for A. A receives B's fence. Handover back: A's writes run at a newer version than the fence and commit, and workflows last written on B load on A |
+| `ForcedFailoverFencesOldActive` | Forced failover with A cut off from the namespace change (zombie). B commits alone. A's new writes, its writes to existing workflows, and its reads of the zombie write are all fenced. A returns: it knows the failover and is drained to B. Two-step rejoin. B waits for A. Failback; everything B acknowledged is on A |
+
+Mutation checks: removing the fencing check fails `ForcedFailoverFencesOldActive`, where the zombie acknowledges a write. Ignoring the record, or reading it only once per wait, fails `DegradedModeAndRejoin`. Unit tests cover:
+
+- the commit set;
+- the write-version decision (including the zombie case);
+- fencing in the shard, including growth only, wake-ups and other namespaces;
+- the ack fencer;
+- sender ordering;
+- admin validation and aggregation.
 
 ## 1. How replication works today, mapped to Raft
 
