@@ -67,9 +67,25 @@ Each mutation breaks one rule. Both TLC and `model.py` find a violation for ever
 | `force-to-any` | Forced failover to B after it was dropped; the new active lacks w1. |
 | `handover-without-drain` | Handover switches before the target has acked everything; an old write is then acknowledged that the new active ignored. |
 
+## Protocol variants
+
+The models are parameterized (`TermRule`, `ForceDropsOld`, `StrictRejoin` in the spec; `--term-rule` in `model.py`):
+
+- **v1 (default):** a forced failover drops the old active from the in-sync set, and rejoin requires the member to know the current failover and both replication directions to be drained. No term rule.
+- **term-rule:** the old active stays in sync after a forced failover, and the active commits and exposes only writes made under its current failover version (version bump). Rejected for v1.
+
+| Check | Result |
+|---|---|
+| v1, 2 writes, 1 failover | OK, 500,776 states (TLC and `model.py` agree) |
+| v1, 2 writes, 2 failovers | OK, 3,629,408 states (TLC and `model.py` agree) |
+| v1, 3 writes, 2 failovers | see below |
+| term-rule, 3 writes, 2 failovers | OK, 49,914,332 states, 420M transitions (TLC) |
+| v1 without the stricter rejoin, or without dropping the old active | violation |
+| v1 mutants: `no-fencing`, `one-step-rejoin`, `active-shrinks-first`, `force-to-any`, `handover-without-drain`, `rejoin-without-knowing`, `rejoin-without-drain`, `rejoin-without-processing` | each violated (TLC and `model.py`) |
+
 ## Protocol changes found by the checker
 
 1. **The fencing check is per write.** An ack can confirm a write only if the acking peer was not active at a newer failover version than the one the write was made under. Comparing against the writer's *current* version is wrong: once the old active has learned the new version, a fenced ack would count again.
-2. **Term rule (Raft's "commit only current-term entries").** The active never commits, or exposes through reads, a write made under an older failover version by counting acks or by committing alone. Such writes become durable when a later write under the current version commits. In Temporal terms:
+2. **The "Figure 8" problem needs one of two fixes.** After failovers A → B → A, a stale write from B at an intermediate version can replace a write A already acknowledged. v1 uses the control-plane rules (drop the old active on forced failover; strict rejoin). The alternative is Raft's term rule: the active never commits, or exposes through reads, a write made under an older failover version by counting acks or by committing alone. Such writes become durable when a later write under the current version commits. In Temporal terms:
    - waiters for writes from an older failover version fail instead of committing;
    - before a new active exposes a workflow whose last write is older than its current failover version, it commits a version-bump transition, like Raft's no-op entry.

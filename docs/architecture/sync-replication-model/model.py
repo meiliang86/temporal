@@ -50,6 +50,15 @@ from collections import deque
 A, B = 0, 1
 OTHER = (B, A)
 ACK_CHANNEL_BOUND = 2
+# Protocol variant (defaults = the agreed v1 protocol):
+#   FORCE_DROPS_OLD: a forced failover drops the old active from the in-sync set.
+#   STRICT_REJOIN:   rejoin also requires the member to know the current failover and both
+#                    replication directions to be drained.
+#   TERM_RULE:       alternative to the two rules above: commit/expose only current-version writes
+#                    (needs a version-bump write in the data plane). Off in v1.
+FORCE_DROPS_OLD = True
+STRICT_REJOIN = True
+TERM_RULE = False
 
 
 def other(c):
@@ -152,7 +161,7 @@ def successors(s, mut, max_w, max_f):
             # Term rule (Raft's "commit only current-term entries"): only the active, and only for a
             # write made under its current failover version. Older writes become durable through a
             # later current-version write.
-            current_term = mut == "no-term-rule" or (active == c and wfv == fv)
+            current_term = mut == "no-term-rule" or not TERM_RULE or (active == c and wfv == fv)
             ok = current_term and all(s.ackwm[c] >= i + 1 and not_fenced for _ in need)
             if ok:
                 emit(f"Commit({c},w{w})", acked=s.acked | {w})
@@ -161,7 +170,7 @@ def successors(s, mut, max_w, max_f):
         # under the active's current failover version (otherwise it must first write a version bump).
         log = s.logs[c]
         if active == c and log and log[-1][0] in s.acked and not set(wids(log)) <= s.acked:
-            if mut == "no-term-rule" or log[-1][1] == fv:
+            if mut == "no-term-rule" or not TERM_RULE or log[-1][1] == fv:
                 emit(f"Read({c})", acked=s.acked | set(wids(log)))
 
         # Process the next replication task from the other cluster.
@@ -199,11 +208,14 @@ def successors(s, mut, max_w, max_f):
                 emit(f"CompleteHandover({c}->{d})", gfv=g, gactive=d, view=setidx(s.view, c, (g, d)),
                      handover=setidx(s.handover, c, False), nfail=s.nfail + 1)
 
-        # Forced failover to c (UpdateNamespace issued on c), only to an in-sync cluster.
+        # Forced failover to c (UpdateNamespace issued on c), only to an in-sync cluster. With
+        # FORCE_DROPS_OLD the control plane also drops the old active (presumed dead) from the in-sync
+        # set in the same step; it must rejoin before it can be promoted again.
         if s.gactive != c and (c in s.cpisr or mut == "force-to-any") and s.nfail < max_f:
             g = s.gfv + 1
+            cp = s.cpisr - {s.gactive} if FORCE_DROPS_OLD else s.cpisr
             emit(f"ForcedFailover(->{c})", gfv=g, gactive=c, view=setidx(s.view, c, (g, c)),
-                 nfail=s.nfail + 1)
+                 nfail=s.nfail + 1, cpisr=cp)
 
         # Control plane drops c from the in-sync set (record first; pushed later).
         if c in s.cpisr and c != s.gactive:
@@ -228,6 +240,15 @@ def successors(s, mut, max_w, max_f):
             a = s.gactive
             waited = c in s.isrv[a]
             caught_up = s.ackwm[a] >= len(s.tq[a]) or mut == "rejoin-without-catch-up"
+            if STRICT_REJOIN:
+                # c knows the current failover, the active processed all of c's leftover tasks
+                # (c -> active drained), and c processed all of the active's tasks.
+                knows = s.view[c] == (s.gfv, s.gactive) or mut == "rejoin-without-knowing"
+                drained = s.pos[a] >= len(s.tq[c]) or mut == "rejoin-without-drain"
+                processed = s.pos[c] >= len(s.tq[a]) or mut == "rejoin-without-processing"
+                if mut == "rejoin-without-processing":
+                    caught_up = True
+                caught_up = caught_up and knows and drained and processed
             if a != c and waited and caught_up:
                 emit(f"CpRejoinFinish({c})", cpisr=s.cpisr | {c}, cpjoin=s.cpjoin - {c})
     return out
@@ -317,7 +338,12 @@ def main():
     p.add_argument("--mutation", default="")
     p.add_argument("--trace", action="store_true", help="print the full counterexample with states")
     p.add_argument("--fingerprint", action="store_true", help="store only state hashes (large bounds)")
+    p.add_argument("--term-rule", action="store_true",
+                   help="variant: term rule (version bump) instead of the control-plane rejoin rules")
     a = p.parse_args()
+    global FORCE_DROPS_OLD, STRICT_REJOIN, TERM_RULE
+    if a.term_rule:
+        FORCE_DROPS_OLD, STRICT_REJOIN, TERM_RULE = False, False, True
     runner = run_fingerprint if a.fingerprint else run
     ok, states, transitions, bad, trace = runner(a.max_writes, a.max_failovers, a.mutation)
     label = a.mutation or "protocol"

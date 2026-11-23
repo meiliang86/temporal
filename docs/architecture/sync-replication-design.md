@@ -59,9 +59,15 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
   - counts an ack toward a write only if the notice is **not newer than the failover version the write was made under**. The check is per write, not against the receiver's current version; the model checker found the latter unsafe;
   - fails pending commits of writes made under older versions immediately;
   - rejects new writes with `NamespaceNotActive` naming the new active.
-- **Term rule** (Raft's "commit only current-term entries", found by the model checker). An active commits, or exposes through reads, only writes made under its current failover version. Older writes become durable when a later write under the current version commits. So:
-  - waiters for writes from an older version fail;
-  - before a new active exposes a workflow whose last write is older than its current failover version, it commits a version-bump transition (Raft's no-op entry). Without this, after failovers A → B → A, a stale write from B at an intermediate version can replace a write A had already acknowledged.
+- **Control-plane failover rules** (found necessary by the model checker; each part is needed):
+  1. A forced failover drops the old active from the in-sync set. It is presumed dead, so the new active runs degraded until the old one rejoins.
+  2. A cluster rejoins the in-sync set, and so can be failed back to, only when all of these hold:
+     - the active already waits for it on every shard (two-step rejoin, step 1);
+     - it has acked every task of the active (caught up);
+     - it knows the current failover: its namespace metadata shows the current failover version;
+     - its own leftover tasks are drained: the active has processed every task it wrote.
+
+  Without these rules, after failovers A → B → A, a stale write from B at an intermediate version can replace a write A had already acknowledged (Raft's "Figure 8"). The alternative fix is Raft's term rule: commit and expose only writes made under the current failover version, with a version-bump write before exposing older state. It is rejected for v1 because it needs a no-op transaction in the data plane and a write on the first read after every failover. The control plane, which keeps a record of every operation and can query the clusters, enforces the rules above instead.
 
 ### Flows
 
@@ -69,8 +75,8 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 |---|---|---|
 | Planned failover | Existing handover workflow, unchanged | None expected (needs a test) |
 | Standby fails | Control plane pushes in-sync = {A}; A commits alone | Degraded mode |
-| Forced failover (A down or partitioned, B in sync) | `UpdateNamespace(active = B)` on B, then in-sync = {B} | Fencing notice |
-| Old active returns | A stops writing (fenced); A → B drains to A's fixed end; B → A catches up; two-step rejoin | `drained_to` / `caught_up` status |
+| Forced failover (A down or partitioned, B in sync) | `UpdateNamespace(active = B)` on B; control plane drops A: in-sync = {B} | Fencing notice |
+| Old active returns | A learns the failover and stops writing (fenced); A → B drains to A's fixed end; B → A catches up; two-step rejoin checks all of it | Status: known failover version, both drain directions, applied in-sync version per shard |
 | Failback | Planned failover once A is in sync | None |
 | Active fails while degraded | Not supported automatically: the namespace waits for A. Manual escape hatch: forced failover by an operator who guarantees A is down, accepting loss of degraded-period writes | None |
 
@@ -80,11 +86,11 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 
 - **`UpdateSyncReplicationState`** (admin, new): sets the in-sync set and `required_acks` for one or more namespaces.
 - **`GetSyncReplicationStatus`** (admin, new), per namespace:
-  - stored state, and the lowest version applied across shards;
-  - role (active, standby, fenced);
-  - per peer and per shard: acked task ID against the highest replication task ID;
-  - `caught_up(peer)` and `drained_to(peer)`;
-  - as follower, the applied position per source shard.
+  - stored state, and the lowest version applied across shards (for rejoin step 1);
+  - role (active, standby, fenced) and the failover version this cluster knows;
+  - per peer and per shard: acked task ID against this cluster's highest replication task ID. Queried on both clusters, this gives both drain directions;
+  - `caught_up(peer)` and `drained_to(peer)` precomputed from the above;
+  - as follower, the applied position per source shard (for three-cluster candidate choice later).
 - **Reused:** `UpdateNamespace`, the handover workflow, `GetReplicationStatus`.
 - **Internal:** a fencing-notice field on the replication ack message.
 
@@ -100,15 +106,15 @@ Builds on Temporal's existing failover. It supersedes §4–5 where they differ 
 
 ### Verification
 
-`sync-replication-model/` holds an exhaustive model checker for this protocol, with results and counterexamples. All invariants hold within the checked bounds. Seven deliberately broken variants are each caught, including the two rules above.
+`sync-replication-model/` holds a TLA+ spec (checked with TLC) and an equivalent Python model checker, with results and counterexamples. All invariants hold within the checked bounds. Every deliberately broken variant is caught, including each part of the control-plane rules and the per-write fencing check.
 
 ### Build order
 
 1. Test planned failover on a sync namespace.
-2. Fencing notice and its handling (per-write check), plus the term rule (old-version waiters fail; version bump before exposing); test a forced failover with A partitioned.
+2. Fencing notice and its handling (per-write check); test a forced failover with A partitioned.
 3. In-sync state storage and the two admin RPCs (proto changes).
 4. Commit by in-sync set; degraded mode.
-5. Rejoin status (`caught_up`, `drained_to`); full A → B → A test.
+5. Rejoin status (known failover version, both drain directions, applied in-sync version); full A → B → A test.
 
 ## 1. How replication works today, mapped to Raft
 

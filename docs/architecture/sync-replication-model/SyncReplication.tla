@@ -29,7 +29,12 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
-CONSTANTS MaxWrites, MaxFailovers, Mutation
+\* ForceDropsOld: a forced failover drops the old active from the in-sync set.
+\* StrictRejoin:  rejoin also requires the member to know the current failover and both
+\*                replication directions to be drained.
+\* TermRule:      alternative to the two rules above: commit/expose only current-version writes.
+\* v1 protocol: ForceDropsOld = StrictRejoin = TRUE, TermRule = FALSE.
+CONSTANTS MaxWrites, MaxFailovers, Mutation, ForceDropsOld, StrictRejoin, TermRule
 
 Clusters == {0, 1}
 Other(c) == 1 - c
@@ -104,7 +109,7 @@ Commit(c, i) ==
     /\ t.w \notin acked
     /\ t.w \in Wids(logs[c])
     \* Term rule: only the active, only writes made under its current failover version.
-    /\ (Mutation = "no-term-rule" \/ (view[c].active = c /\ t.fv = view[c].fv))
+    /\ (Mutation = "no-term-rule" \/ ~TermRule \/ (view[c].active = c /\ t.fv = view[c].fv))
     \* Every other member of c's in-sync set acked it, with a notice not newer than the write.
     /\ \A d \in isrv[c] \ {c} :
           /\ ackwm[c] >= i
@@ -118,7 +123,7 @@ Read(c) ==
     /\ Len(logs[c]) > 0
     /\ Last(logs[c])[1] \in acked
     /\ ~(Wids(logs[c]) \subseteq acked)
-    /\ (Mutation = "no-term-rule" \/ Last(logs[c])[2] = view[c].fv)
+    /\ (Mutation = "no-term-rule" \/ ~TermRule \/ Last(logs[c])[2] = view[c].fv)
     /\ acked' = acked \cup Wids(logs[c])
     /\ UNCHANGED <<logs, tq, pos, ackwm, fence, ackch, view, handover, isrv, cpisr, cpjoin,
                    gfv, gactive, nwrites, nfail>>
@@ -192,7 +197,8 @@ ForcedFailover(c) ==
     /\ gactive' = c
     /\ view' = [view EXCEPT ![c] = [fv |-> gfv + 1, active |-> c]]
     /\ nfail' = nfail + 1
-    /\ UNCHANGED <<logs, tq, pos, ackwm, fence, ackch, handover, isrv, cpisr, cpjoin, acked, nwrites>>
+    /\ cpisr' = IF ForceDropsOld THEN cpisr \ {gactive} ELSE cpisr
+    /\ UNCHANGED <<logs, tq, pos, ackwm, fence, ackch, handover, isrv, cpjoin, acked, nwrites>>
 
 \* Control plane drops c: record first, pushed to clusters later.
 CpShrink(c) ==
@@ -223,12 +229,17 @@ CpRejoinStart(c) ==
     /\ UNCHANGED <<logs, tq, pos, ackwm, fence, ackch, view, handover, isrv, gfv, gactive, acked,
                    nwrites, nfail>>
 
-\* The member becomes promotable once the active waits for it and it has acked every active task.
+\* The member becomes promotable once the active waits for it and it has acked every active task;
+\* with StrictRejoin also once it knows the current failover and both directions are drained.
 CpRejoinFinish(c) ==
     /\ c \in cpjoin
     /\ gactive # c
     /\ c \in isrv[gactive]
-    /\ (ackwm[gactive] >= Len(tq[gactive]) \/ Mutation = "rejoin-without-catch-up")
+    /\ (ackwm[gactive] >= Len(tq[gactive])
+         \/ Mutation \in {"rejoin-without-catch-up", "rejoin-without-processing"})
+    /\ (~StrictRejoin \/ view[c] = [fv |-> gfv, active |-> gactive] \/ Mutation = "rejoin-without-knowing")
+    /\ (~StrictRejoin \/ pos[gactive] >= Len(tq[c]) \/ Mutation = "rejoin-without-drain")
+    /\ (~StrictRejoin \/ pos[c] >= Len(tq[gactive]) \/ Mutation = "rejoin-without-processing")
     /\ cpisr' = cpisr \cup {c}
     /\ cpjoin' = cpjoin \ {c}
     /\ UNCHANGED <<logs, tq, pos, ackwm, fence, ackch, view, handover, isrv, gfv, gactive, acked,
